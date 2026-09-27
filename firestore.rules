@@ -1,0 +1,381 @@
+rules_version = '2';
+
+// Rently 2.0 — Firestore Security Rules v1.1
+//
+// Source of truth:
+// - schema.md v1.3
+// - authorization.md v1.1
+// - cloud-functions.md v1.1
+//
+// SECURITY MODEL
+// 1. These rules protect DIRECT client access to Firestore.
+// 2. Callable Cloud Functions authenticate/authorize the caller themselves.
+// 3. Cloud Functions use the Admin SDK for trusted transactional writes.
+// 4. Admin SDK/server libraries bypass Firestore Security Rules.
+// 5. Any operation requiring consistency across multiple documents is
+//    Cloud-Function-only.
+//
+// Firebase reference:
+// https://firebase.google.com/docs/firestore/security/rules-conditions
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ───────────────────────── AUTH HELPERS ─────────────────────────
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function role() {
+      return isSignedIn() ? request.auth.token.role : null;
+    }
+
+    function isLandlord() {
+      return role() == 'landlord';
+    }
+
+    function isTenant() {
+      return role() == 'tenant';
+    }
+
+    function isSelf(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    // Cross-document field allowlist convention.
+    // Prevents callers from modifying protected identity/derived fields.
+    function onlyChangedFields(allowed) {
+      return request.resource.data.diff(resource.data)
+        .affectedKeys()
+        .hasOnly(allowed);
+    }
+
+    function callerUser() {
+      return get(
+        /databases/$(database)/documents/users/$(request.auth.uid)
+      ).data;
+    }
+
+    function callerActiveLease() {
+      let user = callerUser();
+      return user.activeLeaseId == null
+        ? null
+        : get(
+            /databases/$(database)/documents/leases/$(user.activeLeaseId)
+          ).data;
+    }
+
+    function isCallersProperty(propertyId) {
+      let lease = callerActiveLease();
+      return lease != null && lease.propertyId == propertyId;
+    }
+
+    function isCallersUnit(unitId) {
+      let lease = callerActiveLease();
+      return lease != null && lease.unitId == unitId;
+    }
+
+    // ───────────────────────── USERS ─────────────────────────
+    // User document creation is completeOnboarding()-only.
+    // Role and activeLeaseId are never directly client-writable.
+
+    match /users/{userId} {
+      allow read: if isSelf(userId);
+
+      allow create: if false;
+
+      allow update: if isSelf(userId)
+                    && onlyChangedFields([
+                      'fullName',
+                      'phone',
+                      'photoURL',
+                      'updatedAt'
+                    ]);
+
+      allow delete: if false;
+    }
+
+    // ───────────────────────── PROPERTIES ─────────────────────────
+
+    match /properties/{propertyId} {
+      allow create: if isLandlord()
+                    && request.resource.data.landlordId == request.auth.uid;
+
+      allow read: if
+        (isLandlord()
+          && resource.data.landlordId == request.auth.uid)
+        ||
+        (isTenant()
+          && isCallersProperty(propertyId));
+
+      allow update: if isLandlord()
+                    && resource.data.landlordId == request.auth.uid
+                    && request.resource.data.landlordId
+                       == resource.data.landlordId
+                    && onlyChangedFields([
+                      'name',
+                      'address',
+                      'googleMapsLink',
+                      'status',
+                      'lateFineConfig',
+                      'updatedAt'
+                    ]);
+
+      allow delete: if false;
+    }
+
+    // ───────────────────────── UNITS ─────────────────────────
+    // status/currentLeaseId are derived state and function-managed.
+
+    match /units/{unitId} {
+      allow create: if isLandlord()
+                    && request.resource.data.landlordId
+                       == request.auth.uid
+                    && get(
+                      /databases/$(database)/documents/properties/$(request.resource.data.propertyId)
+                    ).data.landlordId == request.auth.uid;
+
+      allow read: if
+        (isLandlord()
+          && resource.data.landlordId == request.auth.uid)
+        ||
+        (isTenant()
+          && isCallersUnit(unitId));
+
+      allow update: if isLandlord()
+                    && resource.data.landlordId == request.auth.uid
+                    && onlyChangedFields([
+                      'roomNumber',
+                      'baseRent',
+                      'updatedAt'
+                    ]);
+
+      allow delete: if false;
+    }
+
+    // ───────────────────────── JOIN REQUESTS ─────────────────────────
+    // Creation and acceptance are Cloud-Function-only.
+    // Landlord may directly reject a pending request.
+
+    match /joinRequests/{requestId} {
+      allow create: if false;
+
+      allow read: if
+        (isLandlord()
+          && resource.data.landlordId == request.auth.uid)
+        ||
+        (isTenant()
+          && resource.data.tenantId == request.auth.uid);
+
+      allow update: if isLandlord()
+                    && resource.data.landlordId == request.auth.uid
+                    && resource.data.status == 'pending'
+                    && request.resource.data.status == 'rejected'
+                    && onlyChangedFields([
+                      'status',
+                      'respondedAt',
+                      'respondedBy',
+                      'updatedAt'
+                    ]);
+
+      allow delete: if false;
+    }
+
+    // ───────────────────────── LEASES ─────────────────────────
+    // Creation and ending are Cloud-Function-only.
+    // Only currentBaseRent is directly editable by the landlord.
+
+    match /leases/{leaseId} {
+      allow create: if false;
+
+      allow read: if
+        (isLandlord()
+          && resource.data.landlordId == request.auth.uid)
+        ||
+        (isTenant()
+          && resource.data.tenantId == request.auth.uid);
+
+      allow update: if isLandlord()
+                    && resource.data.landlordId == request.auth.uid
+                    && resource.data.status == 'active'
+                    && onlyChangedFields([
+                      'currentBaseRent',
+                      'updatedAt'
+                    ])
+                    && request.resource.data.currentBaseRent is int
+                    && request.resource.data.currentBaseRent >= 0;
+
+      allow delete: if false;
+    }
+
+    // ───────────────────────── RENT CHARGES ─────────────────────────
+
+    match /rentCharges/{rentChargeId} {
+
+      // A landlord may create only a valid draft belonging to one of
+      // their own leases. The deterministic ID prevents duplicate
+      // lease+month bills.
+      allow create: if isLandlord()
+                    && request.resource.data.landlordId
+                       == request.auth.uid
+                    && request.resource.data.status == 'draft'
+                    && request.resource.data.lateFineTotal == 0
+                    && request.resource.data.adjustmentTotal == 0
+                    && rentChargeId ==
+                       request.resource.data.leaseId + '_' +
+                       request.resource.data.billingMonth
+
+                    && get(
+                      /databases/$(database)/documents/leases/$(request.resource.data.leaseId)
+                    ).data.landlordId == request.auth.uid
+
+                    && request.resource.data.tenantId ==
+                       get(
+                         /databases/$(database)/documents/leases/$(request.resource.data.leaseId)
+                       ).data.tenantId
+
+                    && request.resource.data.propertyId ==
+                       get(
+                         /databases/$(database)/documents/leases/$(request.resource.data.leaseId)
+                       ).data.propertyId
+
+                    && request.resource.data.unitId ==
+                       get(
+                         /databases/$(database)/documents/leases/$(request.resource.data.leaseId)
+                       ).data.unitId;
+
+      allow read: if
+        (isLandlord()
+          && resource.data.landlordId == request.auth.uid)
+        ||
+        (isTenant()
+          && resource.data.tenantId == request.auth.uid);
+
+      // Direct client edits are restricted to draft editing only.
+      // Finalization, fines, adjustments, payment state and rollups
+      // are Cloud-Function-only.
+      allow update: if isLandlord()
+                    && resource.data.landlordId == request.auth.uid
+                    && resource.data.status == 'draft'
+                    && request.resource.data.status == 'draft'
+                    && onlyChangedFields([
+                      'lineItems',
+                      'subtotal',
+                      'updatedAt'
+                    ]);
+
+      allow delete: if false;
+
+      // ───────────────────── FINE APPLICATIONS ─────────────────────
+
+      match /fineApplications/{fineId} {
+        allow create: if false;
+
+        allow read: if
+          (isLandlord()
+            && get(
+              /databases/$(database)/documents/rentCharges/$(rentChargeId)
+            ).data.landlordId == request.auth.uid)
+          ||
+          (isTenant()
+            && get(
+              /databases/$(database)/documents/rentCharges/$(rentChargeId)
+            ).data.tenantId == request.auth.uid);
+
+        allow update, delete: if false;
+      }
+
+      // ───────────────────── ADJUSTMENTS ─────────────────────
+
+      match /adjustments/{adjustmentId} {
+        allow create: if false;
+
+        allow read: if
+          (isLandlord()
+            && get(
+              /databases/$(database)/documents/rentCharges/$(rentChargeId)
+            ).data.landlordId == request.auth.uid)
+          ||
+          (isTenant()
+            && get(
+              /databases/$(database)/documents/rentCharges/$(rentChargeId)
+            ).data.tenantId == request.auth.uid);
+
+        allow update, delete: if false;
+      }
+    }
+
+    // ───────────────────────── PAYMENTS ─────────────────────────
+    //
+    // Creation is Cloud-Function-only because payment creation must
+    // atomically update the corresponding rentCharge to payment_pending.
+    //
+    // Verification is Cloud-Function-only because verification must
+    // atomically update BOTH payment and rentCharge.
+    //
+    // This also prevents a tenant from creating a "verified" payment
+    // or a landlord from manually verifying a gateway payment.
+
+    match /payments/{paymentId} {
+      allow create: if false;
+
+      allow read: if
+        (isLandlord()
+          && resource.data.landlordId == request.auth.uid)
+        ||
+        (isTenant()
+          && resource.data.tenantId == request.auth.uid);
+
+      allow update, delete: if false;
+    }
+
+    // ───────────────────────── EXPENSES ─────────────────────────
+    // Hard deletion is disabled. Archive through status: 'archived'.
+
+    match /expenses/{expenseId} {
+      allow create: if isLandlord()
+                    && request.resource.data.landlordId
+                       == request.auth.uid
+                    && get(
+                      /databases/$(database)/documents/properties/$(request.resource.data.propertyId)
+                    ).data.landlordId == request.auth.uid;
+
+      allow read: if isLandlord()
+                  && resource.data.landlordId == request.auth.uid;
+
+      allow update: if isLandlord()
+                    && resource.data.landlordId == request.auth.uid
+                    && onlyChangedFields([
+                      'category',
+                      'description',
+                      'amount',
+                      'date',
+                      'status',
+                      'updatedAt'
+                    ]);
+
+      allow delete: if false;
+    }
+
+    // ───────────────────────── NOTIFICATIONS ─────────────────────────
+    // Server-created only. User can only mark their own notification read.
+
+    match /notifications/{notificationId} {
+      allow create: if false;
+
+      allow read: if isSelf(resource.data.recipientId);
+
+      allow update: if isSelf(resource.data.recipientId)
+                    && onlyChangedFields(['read']);
+
+      allow delete: if false;
+    }
+
+    // ───────────────────────── DEFAULT DENY ─────────────────────────
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -1,0 +1,70 @@
+# Rently Agent Rules
+
+## Purpose
+You are working on Rently, a rental-management system being expanded from the existing landlord-only React/Firebase application into a multi-role system with landlord and tenant workflows.
+
+These rules are mandatory for every implementation task.
+
+## Source of truth
+- `PRD.md` defines product requirements and user-visible behavior.
+- `architecture.md` defines the technical architecture, data boundaries, backend design, and technology decisions.
+- `design.md` defines UX/UI behavior and interaction requirements.
+- `phases.md` defines implementation order and scope.
+- Existing repository code is the source of truth for already-implemented behavior. Do not claim an existing feature works unless it is verified in the repository.
+
+## Agent behavior
+1. Read all five specification files before making substantial changes.
+2. Follow the current phase in `phases.md`. Do not jump ahead.
+3. Do not invent requirements, collections, fields, screens, APIs, payment providers, or business rules.
+4. If a requirement is ambiguous, stop and ask for clarification rather than silently choosing behavior.
+5. Do not change the agreed technology stack without updating `architecture.md` and receiving explicit approval.
+6. Do not replace existing working functionality merely for stylistic reasons.
+7. Prefer small, testable changes over large rewrites.
+8. After each implementation step, verify the result before proceeding.
+9. Report exactly what changed, what was tested, and any unresolved issue.
+10. Never claim a build, test, security rule, payment flow, notification, or integration succeeded unless it was actually verified.
+11. Do not put secrets, service-account credentials, private keys, or privileged Firebase credentials in Flutter/client code.
+12. Client-side hiding of UI is not authorization. Security must be enforced by backend/Firebase rules.
+13. Historical financial records must not be silently overwritten or deleted.
+14. Never delete a tenant's historical lease, rent, payment, or billing records when a tenant leaves.
+15. Preserve the distinction between draft and finalized rent bills.
+16. The 25th reminder does not automatically generate a bill. The landlord must check the electricity bill and manually prepare the upcoming bill.
+17. Do not treat a tenant as a property owner. Tenants apply to join a landlord-owned property; landlords accept the request and assign the tenant a unit/room.
+18. Do not add a payment gateway provider until the provider is explicitly selected.
+19. Cloudinary is the permanent payment-proof provider. Do not use Firebase Storage.
+20. Do not expose or infer sensitive information unnecessarily.
+
+## Coding principles
+- Keep business logic separate from UI.
+- Validate inputs at appropriate boundaries.
+- Use stable document identifiers and explicit relationships.
+- Use Firestore Timestamps for timestamps.
+- Preserve audit information for important financial actions.
+- Keep payment status transitions explicit.
+- Keep landlord and tenant permissions explicit.
+- Avoid duplicated business rules between web and mobile clients where backend enforcement is possible.
+
+## Before implementation
+Confirm:
+- Which phase is being implemented.
+- Which requirement(s) it satisfies.
+- Which existing code/files are affected.
+- Whether a schema or security-rule change is involved.
+
+## After implementation
+Report:
+- Files changed.
+- Behavior implemented.
+- Tests/checks run.
+- Any known limitations.
+- Any requirement that remains unimplemented.
+
+## Forbidden
+- No speculative features.
+- No fake payment verification.
+- No client-only authorization.
+- No automatic bill generation on the 25th.
+- No tenant-created rental properties.
+- No destructive deletion of historical tenant/payment data.
+- No invented payment provider.
+- No silent schema migrations.
