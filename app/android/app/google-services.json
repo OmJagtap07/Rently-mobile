@@ -1,0 +1,68 @@
+{
+  "project_info": {
+    "project_number": "845391905122",
+    "project_id": "tripcircule",
+    "storage_bucket": "tripcircule.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:845391905122:android:602bfa6b07241ce9aeac3b",
+        "android_client_info": {
+          "package_name": "com.example.app"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "845391905122-rm0hatidpl6bjtnscek38edcodip1o1m.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAP6a7ZubcGhYKvpJVSGbYZMMFfpXS3lbI"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "845391905122-rm0hatidpl6bjtnscek38edcodip1o1m.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:845391905122:android:2a9a64b10c81b01daeac3b",
+        "android_client_info": {
+          "package_name": "com.omjagtap.rently"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "845391905122-rm0hatidpl6bjtnscek38edcodip1o1m.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAP6a7ZubcGhYKvpJVSGbYZMMFfpXS3lbI"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "845391905122-rm0hatidpl6bjtnscek38edcodip1o1m.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

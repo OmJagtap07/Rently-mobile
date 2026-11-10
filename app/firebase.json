@@ -1,0 +1,22 @@
+{
+    "flutter": {
+        "platforms": {
+            "android": {
+                "default": {
+                    "projectId": "tripcircule",
+                    "appId": "1:845391905122:android:2a9a64b10c81b01daeac3b",
+                    "fileOutput": "android/app/google-services.json"
+                }
+            },
+            "dart": {
+                "lib/firebase_options.dart": {
+                    "projectId": "tripcircule",
+                    "configurations": {
+                        "android": "1:845391905122:android:2a9a64b10c81b01daeac3b",
+                        "web": "1:845391905122:web:8515c656df5a7044aeac3b"
+                    }
+                }
+            }
+        }
+    }
+}
