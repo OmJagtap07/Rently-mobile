@@ -1,18 +1,42 @@
+import 'dart:async';
+
 import 'package:app/dashboards/tenant_dashboard_screen.dart';
 import 'package:app/dashboards/landlord_dashboard_screen.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  testWidgets('shows the availability message for a pending request', (
+  testWidgets('updates the pending message when unit availability changes', (
     tester,
   ) async {
+    final availability = StreamController<bool>.broadcast();
     await tester.pumpWidget(
-      const MaterialApp(
-        home: Scaffold(body: PendingJoinRequestAvailabilityMessage()),
+      MaterialApp(
+        home: Scaffold(
+          body: PendingJoinRequestAvailabilityMessage(
+            availabilityStream: availability.stream,
+          ),
+        ),
       ),
     );
+    availability.add(true);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 1));
+    expect(
+      find.text(
+        'Your request is pending landlord approval. A unit will be assigned '
+        'if your request is accepted.',
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.textContaining('All units are currently rented out'),
+      findsNothing,
+    );
 
+    availability.add(false);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 1));
     expect(
       find.text(
         "All units are currently rented out. Your request is still pending. "
@@ -20,6 +44,18 @@ void main() {
       ),
       findsOneWidget,
     );
+
+    availability.add(true);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 1));
+    expect(
+      find.text(
+        'Your request is pending landlord approval. A unit will be assigned '
+        'if your request is accepted.',
+      ),
+      findsOneWidget,
+    );
+    await availability.close();
   });
 
   testWidgets('explains unavailable units without rejecting the request', (

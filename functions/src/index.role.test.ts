@@ -2,6 +2,7 @@ import testEnvFactory from "firebase-functions-test";
 import {
   acceptJoinRequest,
   createJoinRequest,
+  getPendingRequestAvailability,
   resolveJoinCode,
 } from "./index";
 import type {CallableRequest} from "firebase-functions/v2/https";
@@ -10,6 +11,9 @@ const testEnv = testEnvFactory({projectId: "demo-rently"});
 const wrapped = {
   acceptJoinRequest: testEnv.wrap(acceptJoinRequest),
   createJoinRequest: testEnv.wrap(createJoinRequest),
+  getPendingRequestAvailability: testEnv.wrap(
+    getPendingRequestAvailability
+  ),
   resolveJoinCode: testEnv.wrap(resolveJoinCode),
 };
 
@@ -85,4 +89,22 @@ describe("callable role authorization", () => {
       wrapped.acceptJoinRequest(request("tenant"))
     ).rejects.toThrow("Only landlords can perform this action.");
   });
+
+  it(
+    "allows tenants to check pending request availability",
+    async () => {
+      await expect(
+        wrapped.getPendingRequestAvailability(request("tenant"))
+      ).rejects.toThrow("propertyId is required.");
+    }
+  );
+
+  it(
+    "denies landlords from checking pending request availability",
+    async () => {
+      await expect(
+        wrapped.getPendingRequestAvailability(request("landlord"))
+      ).rejects.toThrow("Only tenants can perform this action.");
+    }
+  );
 });

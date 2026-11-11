@@ -1,4 +1,6 @@
+import 'dart:async';
 import 'dart:math';
+
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -226,6 +228,46 @@ class PropertyService {
         .collection('joinRequests')
         .where('tenantId', isEqualTo: uid)
         .snapshots();
+  }
+
+  /// Polls a secure server-derived availability result for a pending request.
+  Stream<bool> watchPendingRequestAvailability(String propertyId) {
+    var requestInProgress = false;
+    late Timer timer;
+
+    Future<void> refreshAvailability(StreamController<bool> controller) async {
+      if (requestInProgress) return;
+      requestInProgress = true;
+      try {
+        final callable = _functions.httpsCallable(
+          'getPendingRequestAvailability',
+        );
+        final result = await callable.call({'propertyId': propertyId});
+        final data = Map<String, dynamic>.from(result.data as Map);
+        if (!controller.isClosed) {
+          controller.add(data['hasVacantUnits'] as bool);
+        }
+      } catch (error, stackTrace) {
+        if (!controller.isClosed) {
+          controller.addError(error, stackTrace);
+        }
+      } finally {
+        requestInProgress = false;
+      }
+    }
+
+    late StreamController<bool> controller;
+    controller = StreamController<bool>(
+      onListen: () {
+        unawaited(refreshAvailability(controller));
+        timer = Timer.periodic(
+          const Duration(seconds: 15),
+          (_) => unawaited(refreshAvailability(controller)),
+        );
+      },
+      onCancel: () => timer.cancel(),
+    );
+    return controller.stream;
   }
 
   /// Fetch details of a lease document.

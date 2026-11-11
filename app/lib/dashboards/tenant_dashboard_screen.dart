@@ -7,14 +7,29 @@ import '../auth/auth_service.dart';
 import '../services/property_service.dart';
 
 class PendingJoinRequestAvailabilityMessage extends StatelessWidget {
-  const PendingJoinRequestAvailabilityMessage({super.key});
+  final Stream<bool> availabilityStream;
+
+  const PendingJoinRequestAvailabilityMessage({
+    super.key,
+    required this.availabilityStream,
+  });
 
   @override
   Widget build(BuildContext context) {
-    return const Text(
-      "All units are currently rented out. Your request is still pending. "
-      "We'll assign you a unit when one becomes available.",
-      style: TextStyle(fontSize: 13),
+    return StreamBuilder<bool>(
+      stream: availabilityStream,
+      builder: (context, snapshot) {
+        final message = snapshot.hasError
+            ? 'Could not check unit availability. Your request is still pending.'
+            : snapshot.data == null
+            ? 'Checking unit availability...'
+            : snapshot.data!
+            ? 'Your request is pending landlord approval. A unit will be '
+                  'assigned if your request is accepted.'
+            : "All units are currently rented out. Your request is still "
+                  "pending. We'll assign you a unit when one becomes available.";
+        return Text(message, style: const TextStyle(fontSize: 13));
+      },
     );
   }
 }
@@ -489,6 +504,7 @@ class _TenantDashboardScreenState extends State<TenantDashboardScreen> {
                   final data = requests[index].data();
                   final propertyName = data['propertyName'] ?? 'Property';
                   final status = data['status'] ?? 'pending';
+                  final propertyId = data['propertyId'] as String?;
 
                   Color badgeColor;
                   Color textColor;
@@ -524,7 +540,19 @@ class _TenantDashboardScreenState extends State<TenantDashboardScreen> {
                           Text('Status: $label'),
                           if (status == 'pending') ...[
                             const SizedBox(height: 4),
-                            const PendingJoinRequestAvailabilityMessage(),
+                            if (propertyId != null && propertyId.isNotEmpty)
+                              PendingJoinRequestAvailabilityMessage(
+                                availabilityStream: _propertyService
+                                    .watchPendingRequestAvailability(
+                                      propertyId,
+                                    ),
+                              )
+                            else
+                              const Text(
+                                'Could not check unit availability. '
+                                'Your request is still pending.',
+                                style: TextStyle(fontSize: 13),
+                              ),
                           ],
                         ],
                       ),

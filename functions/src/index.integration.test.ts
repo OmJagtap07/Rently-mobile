@@ -421,6 +421,80 @@ describe("createJoinRequest emulator integration", () => {
   });
 });
 
+describe(
+  "getPendingRequestAvailability emulator integration",
+  () => {
+    it(
+      "reports when a pending request has vacant units",
+      async () => {
+        await addJoinRequest(
+          fixture.tenant.uid,
+          fixture.propertyId,
+          fixture.landlord.uid,
+          "Phase 3 Property"
+        );
+
+        const response = await callFunction(
+          "getPendingRequestAvailability",
+          fixture.tenant,
+          {propertyId: fixture.propertyId}
+        );
+
+        expect(response.error).toBeUndefined();
+        expect(response.result?.hasVacantUnits).toBe(true);
+      }
+    );
+
+    it(
+      "reports when every unit for a pending request is occupied",
+      async () => {
+        await addJoinRequest(
+          fixture.tenant.uid,
+          fixture.propertyId,
+          fixture.landlord.uid,
+          "Phase 3 Property"
+        );
+        await firestore().collection("units")
+          .doc(fixture.vacantUnitId).update({
+            status: "occupied",
+          });
+
+        const response = await callFunction(
+          "getPendingRequestAvailability",
+          fixture.tenant,
+          {propertyId: fixture.propertyId}
+        );
+
+        expect(response.error).toBeUndefined();
+        expect(response.result?.hasVacantUnits).toBe(false);
+      }
+    );
+
+    it(
+      "does not disclose availability without a pending request",
+      async () => {
+        const response = await callFunction(
+          "getPendingRequestAvailability",
+          fixture.tenant,
+          {propertyId: fixture.propertyId}
+        );
+
+        expect(response.error?.status).toBe("FAILED_PRECONDITION");
+      }
+    );
+
+    it("rejects a landlord caller", async () => {
+      const response = await callFunction(
+        "getPendingRequestAvailability",
+        fixture.landlord,
+        {propertyId: fixture.propertyId}
+      );
+
+      expect(response.error?.status).toBe("PERMISSION_DENIED");
+    });
+  }
+);
+
 describe("acceptJoinRequest emulator integration", () => {
   it(
     "creates an active lease, occupies the unit, links the tenant, " +
@@ -598,6 +672,14 @@ describe("acceptJoinRequest emulator integration", () => {
         .get();
       expect(thirdRequest.data()?.status).toBe("pending");
 
+      const noAvailability = await callFunction(
+        "getPendingRequestAvailability",
+        thirdTenant,
+        {propertyId: fixture.propertyId}
+      );
+      expect(noAvailability.error).toBeUndefined();
+      expect(noAvailability.result?.hasVacantUnits).toBe(false);
+
       const releasedLease = await callFunction(
         "endLease",
         fixture.landlord,
@@ -607,6 +689,14 @@ describe("acceptJoinRequest emulator integration", () => {
         }
       );
       expect(releasedLease.error).toBeUndefined();
+
+      const availabilityAfterMoveOut = await callFunction(
+        "getPendingRequestAvailability",
+        thirdTenant,
+        {propertyId: fixture.propertyId}
+      );
+      expect(availabilityAfterMoveOut.error).toBeUndefined();
+      expect(availabilityAfterMoveOut.result?.hasVacantUnits).toBe(true);
 
       const finalAcceptance = await callFunction(
         "acceptJoinRequest",
@@ -629,6 +719,21 @@ describe("acceptJoinRequest emulator integration", () => {
       expect(assignedUnit.data()?.currentLeaseId).toBe(
         finalAcceptance.result?.leaseId
       );
+      const thirdTenantProfile = await firestore()
+        .collection("users")
+        .doc(thirdTenant.uid)
+        .get();
+      expect(thirdTenantProfile.data()?.activeLeaseId).toBe(
+        finalAcceptance.result?.leaseId
+      );
+
+      const availabilityAfterAcceptance = await callFunction(
+        "getPendingRequestAvailability",
+        thirdTenant,
+        {propertyId: fixture.propertyId}
+      );
+      expect(availabilityAfterAcceptance.error?.status)
+        .toBe("FAILED_PRECONDITION");
     }
   );
 });

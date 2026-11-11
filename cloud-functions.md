@@ -78,6 +78,7 @@ Deliberately excludes `joinCode`, `landlordId`, and any other field — this is 
 ## 3. `createJoinRequest`
 
 **Trigger:** callable
+
 **Auth:** `role == 'tenant'`.
 
 **Input:**
@@ -99,6 +100,30 @@ Deliberately excludes `joinCode`, `landlordId`, and any other field — this is 
 **Errors:** `failed-precondition` (property not active, tenant already has an active lease), `already-exists` (duplicate pending request for this tenant/property — returns the existing request's ID rather than erroring, so a client retry is a clean no-op), `not-found`, `permission-denied`.
 
 **Idempotency:** the tenant+property+`pending` uniqueness check *is* the idempotency guard — no separate key needed, unlike `applyManualFine()`/`applyAdjustment()` where no natural key exists.
+
+### Pending request availability (`getPendingRequestAvailability`)
+
+**Trigger type:** callable
+
+**Auth:** `role == 'tenant'`.
+
+**Input:**
+```ts
+{ propertyId: string }
+```
+
+The function verifies the caller has a pending request for the property, then
+uses the Admin SDK to check whether any unit belonging to that property and
+landlord has `status == 'vacant'`. It returns only
+`{ hasVacantUnits: boolean }`; it does not expose unit details or grant tenants
+direct access to the `units` collection. The tenant dashboard refreshes this
+server-derived result every 15 seconds while the request is pending.
+
+**Errors:** `permission-denied` (caller is not a tenant),
+`failed-precondition` (caller has no pending request for the property),
+`invalid-argument` (missing `propertyId`).
+
+**Idempotency:** pure read.
 
 ---
 
@@ -425,6 +450,7 @@ Deliberately excludes `joinCode`, `landlordId`, and any other field — this is 
 | completeOnboarding | callable | any (pre-role) |
 | resolveJoinCode | callable | tenant |
 | createJoinRequest | callable | tenant |
+| getPendingRequestAvailability | callable | tenant |
 | acceptJoinRequest | callable | landlord |
 | endLease | callable | landlord |
 | finalizeRentCharge | callable | landlord |
