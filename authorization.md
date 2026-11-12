@@ -99,7 +99,7 @@ Both creation and termination are 🔒 because each must atomically touch `lease
 | Operation | Landlord | Tenant |
 |---|---|---|
 | Create (`draft`) | 🟢 own-property lease | — |
-| Update `lineItems`/`subtotal` while `status == 'draft'` | 🟢 own | — |
+| Update `lineItems`/`subtotal`/`total` while `status == 'draft'` | 🟢 own | — |
 | Read | 🟢 own-property | 🟢 own |
 | `draft` → `finalized` | 🔒 `finalizeRentCharge()` only | — |
 | Update `lateFineTotal`/`total` (via fine) | 🔒 `applyManualFine()` / scheduled auto-fine job only | — |
@@ -108,6 +108,14 @@ Both creation and termination are 🔒 because each must atomically touch `lease
 | `payment_pending` → `paid`/`due`/`overdue` | 🔒 `verifyUpiPayment()` / `verifyGatewayPayment()` only | — |
 | `due` → `overdue`, `finalized` → `due` | 🔒 scheduled job only | — |
 | Delete | — | — |
+
+Draft creation stores the billing-month due date (the 10th) and a provisional
+`total` equal to `subtotal`. Drafts allow at most 10 line items; Rules validate
+each item's exact shape, type, and integer-paise amount, the subtotal sum, and
+the provisional total. Draft edits may update `lineItems`, `subtotal`, and
+`total` together, but must still satisfy the same validation. Finalization
+revalidates the line items server-side and writes the authoritative totals and
+due date.
 
 ### 6.1 Subcollection `fineApplications`
 

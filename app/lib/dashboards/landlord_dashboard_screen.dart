@@ -3,6 +3,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 
 import '../auth/auth_service.dart';
 import '../services/property_service.dart';
+import 'landlord/monthly_billing_screen.dart';
 import 'landlord/property_details_screen.dart';
 
 class NoAvailableUnitsNotice extends StatelessWidget {
@@ -624,9 +625,11 @@ class _LandlordDashboardScreenState extends State<LandlordDashboardScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(
-          _currentIndex == 0 ? 'Properties & Rooms' : 'Join Requests',
-        ),
+        title: Text(switch (_currentIndex) {
+          0 => 'Properties & Rooms',
+          1 => 'Join Requests',
+          _ => 'Monthly Billing',
+        }),
         actions: [
           IconButton(
             icon: const Icon(Icons.logout),
@@ -635,9 +638,11 @@ class _LandlordDashboardScreenState extends State<LandlordDashboardScreen> {
           ),
         ],
       ),
-      body: _currentIndex == 0
-          ? _buildPropertiesTab()
-          : _buildJoinRequestsTab(),
+      body: switch (_currentIndex) {
+        0 => _buildPropertiesTab(),
+        1 => _buildJoinRequestsTab(),
+        _ => MonthlyBillingScreen(repository: _propertyService),
+      },
       floatingActionButton: _currentIndex == 0
           ? FloatingActionButton.extended(
               onPressed: _showAddPropertyDialog,
@@ -658,6 +663,11 @@ class _LandlordDashboardScreenState extends State<LandlordDashboardScreen> {
             icon: Icon(Icons.mark_email_unread_outlined),
             selectedIcon: Icon(Icons.mark_email_unread),
             label: 'Join Requests',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.receipt_long_outlined),
+            selectedIcon: Icon(Icons.receipt_long),
+            label: 'Billing',
           ),
         ],
       ),

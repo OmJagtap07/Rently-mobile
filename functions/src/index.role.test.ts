@@ -1,7 +1,9 @@
 import testEnvFactory from "firebase-functions-test";
 import {
+  applyAdjustment,
   acceptJoinRequest,
   createJoinRequest,
+  finalizeRentCharge,
   resolveJoinCode,
 } from "./index";
 import type {CallableRequest} from "firebase-functions/v2/https";
@@ -9,7 +11,9 @@ import type {CallableRequest} from "firebase-functions/v2/https";
 const testEnv = testEnvFactory({projectId: "demo-rently"});
 const wrapped = {
   acceptJoinRequest: testEnv.wrap(acceptJoinRequest),
+  applyAdjustment: testEnv.wrap(applyAdjustment),
   createJoinRequest: testEnv.wrap(createJoinRequest),
+  finalizeRentCharge: testEnv.wrap(finalizeRentCharge),
   resolveJoinCode: testEnv.wrap(resolveJoinCode),
 };
 
@@ -84,5 +88,44 @@ describe("callable role authorization", () => {
     await expect(
       wrapped.acceptJoinRequest(request("tenant"))
     ).rejects.toThrow("Only landlords can perform this action.");
+  });
+
+  it(
+    "allows landlords to reach rent-charge finalization validation",
+    async () => {
+      await expect(
+        wrapped.finalizeRentCharge(request("landlord"))
+      ).rejects.toThrow("rentChargeId is required.");
+    }
+  );
+
+  it("denies tenants from finalizing rent charges", async () => {
+    await expect(
+      wrapped.finalizeRentCharge(request("tenant"))
+    ).rejects.toThrow("Only landlords can perform this action.");
+  });
+
+  it("rejects unauthenticated rent-charge finalization", async () => {
+    await expect(
+      wrapped.finalizeRentCharge({...request("landlord"), auth: undefined})
+    ).rejects.toThrow("User must be authenticated.");
+  });
+
+  it("allows landlords to reach adjustment validation", async () => {
+    await expect(
+      wrapped.applyAdjustment(request("landlord"))
+    ).rejects.toThrow("rentChargeId is required.");
+  });
+
+  it("denies tenants from applying rent-charge adjustments", async () => {
+    await expect(
+      wrapped.applyAdjustment(request("tenant"))
+    ).rejects.toThrow("Only landlords can perform this action.");
+  });
+
+  it("rejects unauthenticated rent-charge adjustments", async () => {
+    await expect(
+      wrapped.applyAdjustment({...request("landlord"), auth: undefined})
+    ).rejects.toThrow("User must be authenticated.");
   });
 });

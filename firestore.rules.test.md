@@ -142,6 +142,18 @@ Auth claims:
 | RC-15 | landlordA | Create wrong tenantId | DENY |
 | RC-16 | landlordA | Create wrong propertyId | DENY |
 | RC-17 | landlordA | Create wrong unitId | DENY |
+| RC-18 | landlordA | Create invalid billing month | DENY |
+| RC-19 | landlordA | Create draft for ended lease | DENY |
+| RC-20 | landlordA | Create draft when tenant no longer points to lease | DENY |
+| RC-21 | landlordA | Create draft with mismatched total | DENY |
+| RC-22 | landlordA | Edit draft with mismatched total | DENY |
+| RC-23 | landlordA | Reuse deterministic draft ID | ALLOW |
+| RC-24 | landlordA | Create invalid line item shape/type/amount | DENY |
+| RC-25 | landlordA | Create subtotal not equal to line-item sum | DENY |
+| RC-26 | landlordA | Create draft with undeclared field | DENY |
+| RC-27 | landlordA | Edit draft with subtotal not equal to line-item sum | DENY |
+| RC-28 | landlordA | Create draft with 10 valid line items | ALLOW |
+| RC-29 | landlordA | Create draft with more than 10 line items | DENY |
 
 ### Fine applications
 

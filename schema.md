@@ -153,7 +153,7 @@ Using a deterministic ID instead of an auto-ID prevents a landlord from accident
 | adjustmentTotal | integer (paise) | yes | sum of applied adjustments, can be negative (see §6.3); defaults to 0; updated only by `applyAdjustment()` |
 | total | integer (paise) | yes | **`subtotal + lateFineTotal + adjustmentTotal`** — the current amount payable. Recomputed transactionally by whichever function (`applyManualFine()`, the auto-fine job, or `applyAdjustment()`) touches `lateFineTotal` or `adjustmentTotal`; never written directly by a client. |
 | status | enum: `draft` \| `finalized` \| `due` \| `overdue` \| `payment_pending` \| `paid` | yes | see transition table below |
-| dueDate | string `YYYY-MM-DD` | yes | set at finalize (10th of billing month per PRD §9) |
+| dueDate | string `YYYY-MM-DD` | yes | precomputed on the draft as the 10th of the billing month; revalidated and written again at finalization (per PRD §9) |
 | finalizedAt / finalizedBy | Timestamp / string | no | set once, then immutable |
 | paidAt | Timestamp | no | |
 | createdAt / updatedAt | Timestamp | yes | |

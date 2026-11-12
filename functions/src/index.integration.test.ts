@@ -51,6 +51,8 @@ interface Fixture {
   authUids: string[];
   propertyIds: string[];
   tenantIds: string[];
+  leaseIds: string[];
+  rentChargeIds: string[];
 }
 
 let fixture: Fixture;
@@ -111,6 +113,24 @@ async function callFunction(
 }
 
 /**
+ * Invokes a callable through the Functions emulator without an auth token.
+ * @param {string} name Callable function name
+ * @param {Record<string, unknown>} data Callable input
+ * @return {Promise<CallableResponse>} Callable protocol response
+ */
+async function callUnauthenticatedFunction(
+  name: string,
+  data: Record<string, unknown>
+): Promise<CallableResponse> {
+  const response = await fetch(`${functionsEmulatorUrl}/${name}`, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({data}),
+  });
+  return await response.json() as CallableResponse;
+}
+
+/**
  * Seeds a pending join request for an acceptance test.
  * @param {string} tenantId Requesting tenant UID
  * @param {string} propertyId Target property ID
@@ -153,6 +173,81 @@ async function createTenantProfile(tenant: TestUser): Promise<void> {
 }
 
 /**
+ * Creates a consistent active lease fixture for billing tests.
+ * @return {Promise<string>} New lease ID
+ */
+async function createBillingLease(): Promise<string> {
+  const leaseId = `phase5-lease-${randomUUID()}`;
+  const now = admin.firestore.FieldValue.serverTimestamp();
+  await Promise.all([
+    firestore().collection("leases").doc(leaseId).set({
+      tenantId: fixture.tenant.uid,
+      landlordId: fixture.landlord.uid,
+      propertyId: fixture.propertyId,
+      unitId: fixture.occupiedUnitId,
+      joiningDate: "2026-01-01",
+      currentBaseRent: 125000,
+      status: "active",
+      createdAt: now,
+      updatedAt: now,
+    }),
+    firestore().collection("units").doc(fixture.occupiedUnitId).update({
+      status: "occupied",
+      currentLeaseId: leaseId,
+    }),
+    firestore().collection("users").doc(fixture.tenant.uid).update({
+      activeLeaseId: leaseId,
+    }),
+  ]);
+  fixture.leaseIds.push(leaseId);
+  return leaseId;
+}
+
+/**
+ * Seeds a draft bill with the schema's deterministic lease/month ID.
+ * @param {string} leaseId Lease referenced by the bill
+ * @param {Record<string, unknown>} overrides Test-only field overrides
+ * @return {Promise<string>} New rent charge ID
+ */
+async function addRentChargeDraft(
+  leaseId: string,
+  overrides: Record<string, unknown> = {}
+): Promise<string> {
+  const billingMonth = (overrides.billingMonth as string | undefined) ??
+    "2026-11";
+  const rentChargeId = `${leaseId}_${billingMonth}`;
+  const lineItems = [
+    {type: "rent", label: "Rent", amount: 125000},
+    {type: "electricity", label: "Electricity", amount: 12345},
+    {type: "maintenance", label: "Maintenance", amount: 5000},
+    {type: "other", label: "Other", amount: 250},
+  ];
+  const subtotal = lineItems.reduce((sum, item) => sum + item.amount, 0);
+  const now = admin.firestore.FieldValue.serverTimestamp();
+
+  await firestore().collection("rentCharges").doc(rentChargeId).set({
+    leaseId,
+    tenantId: fixture.tenant.uid,
+    landlordId: fixture.landlord.uid,
+    propertyId: fixture.propertyId,
+    unitId: fixture.occupiedUnitId,
+    billingMonth,
+    lineItems,
+    subtotal,
+    lateFineTotal: 0,
+    adjustmentTotal: 0,
+    total: subtotal,
+    dueDate: `${billingMonth}-10`,
+    status: "draft",
+    createdAt: now,
+    updatedAt: now,
+    ...overrides,
+  });
+  fixture.rentChargeIds.push(rentChargeId);
+  return rentChargeId;
+}
+
+/**
  * Deletes all documents matching one field value at a time.
  * @param {string} collectionName Firestore collection to clean
  * @param {string} field Query field
@@ -187,6 +282,17 @@ async function deleteMatching(
 async function cleanupFixture(): Promise<void> {
   if (!fixture) return;
 
+  for (const rentChargeId of fixture.rentChargeIds) {
+    const adjustments = await firestore()
+      .collection("rentCharges")
+      .doc(rentChargeId)
+      .collection("adjustments")
+      .get();
+    const batch = firestore().batch();
+    adjustments.docs.forEach((doc) => batch.delete(doc.ref));
+    if (!adjustments.empty) await batch.commit();
+    await firestore().collection("rentCharges").doc(rentChargeId).delete();
+  }
   await deleteMatching("joinRequests", "tenantId", fixture.tenantIds);
   await deleteMatching("leases", "tenantId", fixture.tenantIds);
   await deleteMatching("units", "propertyId", fixture.propertyIds);
@@ -201,8 +307,8 @@ async function cleanupFixture(): Promise<void> {
 }
 
 beforeAll(() => {
-  return import("firebase-admin").then((firebaseAdmin) => {
-    admin = firebaseAdmin;
+  return import("firebase-admin").then((firebaseAdminModule) => {
+    admin = firebaseAdminModule.default;
     if (admin.apps.length) return;
     admin.initializeApp({projectId});
   });
@@ -228,6 +334,8 @@ beforeEach(async () => {
     authUids: [landlord.uid, otherLandlord.uid, tenant.uid],
     propertyIds: [propertyId, otherPropertyId],
     tenantIds: [tenant.uid],
+    leaseIds: [],
+    rentChargeIds: [],
   };
 
   const db = firestore();
@@ -629,6 +737,613 @@ describe("acceptJoinRequest emulator integration", () => {
       expect(assignedUnit.data()?.currentLeaseId).toBe(
         finalAcceptance.result?.leaseId
       );
+    }
+  );
+});
+
+describe("monthly rent-charge emulator integration", () => {
+  it(
+    "finalizes a bill using integer paise and the tenth as its due date",
+    async () => {
+      const leaseId = await createBillingLease();
+      const rentChargeId = await addRentChargeDraft(leaseId);
+
+      const response = await callFunction(
+        "finalizeRentCharge",
+        fixture.landlord,
+        {rentChargeId}
+      );
+
+      expect(response.error).toBeUndefined();
+      expect(response.result).toMatchObject({
+        success: true,
+        rentChargeId,
+        dueDate: "2026-11-10",
+        total: 142595,
+      });
+
+      const finalized = await firestore()
+        .collection("rentCharges")
+        .doc(rentChargeId)
+        .get();
+      expect(finalized.data()).toMatchObject({
+        status: "finalized",
+        subtotal: 142595,
+        total: 142595,
+        dueDate: "2026-11-10",
+        finalizedBy: fixture.landlord.uid,
+        lineItems: [
+          {type: "rent", amount: 125000},
+          {type: "electricity", amount: 12345},
+          {type: "maintenance", amount: 5000},
+          {type: "other", amount: 250},
+        ],
+      });
+      expect(finalized.data()?.finalizedAt).toBeInstanceOf(
+        admin.firestore.Timestamp
+      );
+    }
+  );
+
+  it(
+    "rejects tenant and unauthenticated callers without changing the draft",
+    async () => {
+      const leaseId = await createBillingLease();
+      const rentChargeId = await addRentChargeDraft(leaseId);
+
+      const tenantResponse = await callFunction(
+        "finalizeRentCharge",
+        fixture.tenant,
+        {rentChargeId}
+      );
+      const unauthenticatedResponse = await callUnauthenticatedFunction(
+        "finalizeRentCharge",
+        {rentChargeId}
+      );
+
+      expect(tenantResponse.error?.status).toBe("PERMISSION_DENIED");
+      expect(unauthenticatedResponse.error?.status).toBe("UNAUTHENTICATED");
+      expect(
+        (await firestore().collection("rentCharges").doc(rentChargeId).get())
+          .data()?.status
+      ).toBe("draft");
+    }
+  );
+
+  it(
+    "rejects a landlord who does not own the bill",
+    async () => {
+      const leaseId = await createBillingLease();
+      const rentChargeId = await addRentChargeDraft(leaseId);
+
+      const response = await callFunction(
+        "finalizeRentCharge",
+        fixture.otherLandlord,
+        {rentChargeId}
+      );
+
+      expect(response.error?.status).toBe("PERMISSION_DENIED");
+      expect(
+        (await firestore().collection("rentCharges").doc(rentChargeId).get())
+          .data()?.status
+      ).toBe("draft");
+    }
+  );
+
+  it(
+    "rejects malformed billing months and missing referenced leases",
+    async () => {
+      const leaseId = await createBillingLease();
+      const invalidMonthId = await addRentChargeDraft(leaseId, {
+        billingMonth: "2026-13",
+      });
+      const invalidMonthResponse = await callFunction(
+        "finalizeRentCharge",
+        fixture.landlord,
+        {rentChargeId: invalidMonthId}
+      );
+
+      expect(invalidMonthResponse.error?.status).toBe("INVALID_ARGUMENT");
+
+      const missingLeaseId = await addRentChargeDraft(
+        `missing-lease-${randomUUID()}`
+      );
+      const missingLeaseResponse = await callFunction(
+        "finalizeRentCharge",
+        fixture.landlord,
+        {rentChargeId: missingLeaseId}
+      );
+
+      expect(missingLeaseResponse.error?.status).toBe("NOT_FOUND");
+      expect(
+        (await firestore().collection("rentCharges").doc(invalidMonthId).get())
+          .data()?.status
+      ).toBe("draft");
+      expect(
+        (await firestore().collection("rentCharges").doc(missingLeaseId).get())
+          .data()?.status
+      ).toBe("draft");
+    }
+  );
+
+  it.each(["tenantId", "propertyId", "unitId"])(
+    "rejects a draft with a mismatched %s reference",
+    async (field) => {
+      const leaseId = await createBillingLease();
+      const value = field === "tenantId" ?
+        fixture.otherLandlord.uid :
+        field === "propertyId" ?
+          fixture.otherPropertyId :
+          fixture.vacantUnitId;
+      const rentChargeId = await addRentChargeDraft(
+        leaseId,
+        {[field]: value}
+      );
+
+      const response = await callFunction(
+        "finalizeRentCharge",
+        fixture.landlord,
+        {rentChargeId}
+      );
+
+      expect(response.error?.status).toBe("FAILED_PRECONDITION");
+      expect(
+        (await firestore().collection("rentCharges").doc(rentChargeId).get())
+          .data()?.status
+      ).toBe("draft");
+    }
+  );
+
+  it.each(["tenantId", "propertyId", "unitId"])(
+    "rejects a draft with a missing %s document",
+    async (field) => {
+      const leaseId = await createBillingLease();
+      const value = `phase5-missing-${field}-${randomUUID()}`;
+      const rentChargeId = await addRentChargeDraft(leaseId, {[field]: value});
+
+      const response = await callFunction(
+        "finalizeRentCharge",
+        fixture.landlord,
+        {rentChargeId}
+      );
+
+      expect(response.error?.status).toBe("NOT_FOUND");
+      expect(
+        (await firestore().collection("rentCharges").doc(rentChargeId).get())
+          .data()?.status
+      ).toBe("draft");
+    }
+  );
+
+  it(
+    "rejects ended leases and subtotal mismatches without partial writes",
+    async () => {
+      const endedLeaseId = await createBillingLease();
+      const endedRentChargeId = await addRentChargeDraft(endedLeaseId);
+      await firestore().collection("leases").doc(endedLeaseId).update({
+        status: "ended",
+      });
+      const endedLeaseResponse = await callFunction(
+        "finalizeRentCharge",
+        fixture.landlord,
+        {rentChargeId: endedRentChargeId}
+      );
+      expect(endedLeaseResponse.error?.status).toBe("FAILED_PRECONDITION");
+
+      const activeLeaseId = await createBillingLease();
+      const mismatchedRentChargeId = await addRentChargeDraft(activeLeaseId, {
+        subtotal: 1,
+      });
+      const subtotalResponse = await callFunction(
+        "finalizeRentCharge",
+        fixture.landlord,
+        {rentChargeId: mismatchedRentChargeId}
+      );
+
+      expect(subtotalResponse.error?.status).toBe("FAILED_PRECONDITION");
+      const [endedBill, mismatchedBill] = await Promise.all([
+        firestore().collection("rentCharges").doc(endedRentChargeId).get(),
+        firestore().collection("rentCharges").doc(mismatchedRentChargeId).get(),
+      ]);
+      expect(endedBill.data()?.status).toBe("draft");
+      expect(mismatchedBill.data()?.status).toBe("draft");
+      expect(mismatchedBill.data()?.dueDate).toBe("2026-11-10");
+      expect(mismatchedBill.data()?.finalizedAt).toBeUndefined();
+    }
+  );
+
+  it.each(["missing", "duplicate"])(
+    "rejects a draft with a %s rent line item",
+    async (rentCase) => {
+      const leaseId = await createBillingLease();
+      const lineItems = rentCase === "missing" ?
+        [
+          {type: "electricity", label: "Electricity", amount: 12345},
+          {type: "maintenance", label: "Maintenance", amount: 5000},
+          {type: "other", label: "Other", amount: 250},
+        ] :
+        [
+          {type: "rent", label: "Rent", amount: 125000},
+          {type: "rent", label: "Second rent", amount: 1},
+          {type: "electricity", label: "Electricity", amount: 12345},
+          {type: "maintenance", label: "Maintenance", amount: 5000},
+          {type: "other", label: "Other", amount: 250},
+        ];
+      const subtotal = lineItems.reduce((sum, item) => sum + item.amount, 0);
+      const rentChargeId = await addRentChargeDraft(leaseId, {
+        lineItems,
+        subtotal,
+        total: subtotal,
+      });
+
+      const response = await callFunction(
+        "finalizeRentCharge",
+        fixture.landlord,
+        {rentChargeId}
+      );
+
+      expect(response.error?.status).toBe("FAILED_PRECONDITION");
+      expect(response.error?.message).toContain(
+        "exactly one rent line item"
+      );
+      expect(
+        (await firestore().collection("rentCharges").doc(rentChargeId).get())
+          .data()?.status
+      ).toBe("draft");
+    }
+  );
+
+  it("rejects a draft with more than ten line items", async () => {
+    const leaseId = await createBillingLease();
+    const lineItems = [
+      {type: "rent", label: "Rent", amount: 125000},
+      ...Array.from({length: 10}, (_, index) => ({
+        type: "other",
+        label: `Other ${index + 1}`,
+        amount: 1,
+      })),
+    ];
+    const subtotal = lineItems.reduce((sum, item) => sum + item.amount, 0);
+    const rentChargeId = await addRentChargeDraft(leaseId, {
+      lineItems,
+      subtotal,
+      total: subtotal,
+    });
+
+    const response = await callFunction(
+      "finalizeRentCharge",
+      fixture.landlord,
+      {rentChargeId}
+    );
+
+    expect(response.error?.status).toBe("FAILED_PRECONDITION");
+    expect(response.error?.message).toContain(
+      "between one and ten valid line items"
+    );
+    expect(
+      (await firestore().collection("rentCharges").doc(rentChargeId).get())
+        .data()?.status
+    ).toBe("draft");
+  });
+
+  it("rejects a draft with a due date other than the tenth", async () => {
+    const leaseId = await createBillingLease();
+    const rentChargeId = await addRentChargeDraft(leaseId, {
+      dueDate: "2026-11-11",
+    });
+
+    const response = await callFunction(
+      "finalizeRentCharge",
+      fixture.landlord,
+      {rentChargeId}
+    );
+
+    expect(response.error?.status).toBe("FAILED_PRECONDITION");
+    const bill = await firestore()
+      .collection("rentCharges")
+      .doc(rentChargeId)
+      .get();
+    expect(bill.data()?.status).toBe("draft");
+    expect(bill.data()?.dueDate).toBe("2026-11-11");
+  });
+
+  it("rejects negative line-item amounts during finalization", async () => {
+    const leaseId = await createBillingLease();
+    const lineItems = [
+      {type: "rent", label: "Rent", amount: 125000},
+      {type: "electricity", label: "Electricity", amount: -1},
+      {type: "maintenance", label: "Maintenance", amount: 5000},
+    ];
+    const subtotal = lineItems.reduce((sum, item) => sum + item.amount, 0);
+    const rentChargeId = await addRentChargeDraft(leaseId, {
+      lineItems,
+      subtotal,
+      total: subtotal,
+    });
+
+    const response = await callFunction(
+      "finalizeRentCharge",
+      fixture.landlord,
+      {rentChargeId}
+    );
+
+    expect(response.error?.status).toBe("FAILED_PRECONDITION");
+    expect(
+      (await firestore().collection("rentCharges").doc(rentChargeId).get())
+        .data()?.status
+    ).toBe("draft");
+  });
+
+  it("does not finalize a bill twice", async () => {
+    const leaseId = await createBillingLease();
+    const rentChargeId = await addRentChargeDraft(leaseId);
+    const first = await callFunction(
+      "finalizeRentCharge",
+      fixture.landlord,
+      {rentChargeId}
+    );
+    const beforeRetry = await firestore()
+      .collection("rentCharges")
+      .doc(rentChargeId)
+      .get();
+    const retry = await callFunction(
+      "finalizeRentCharge",
+      fixture.landlord,
+      {rentChargeId}
+    );
+    const afterRetry = await firestore()
+      .collection("rentCharges")
+      .doc(rentChargeId)
+      .get();
+
+    expect(first.error).toBeUndefined();
+    expect(retry.error?.status).toBe("FAILED_PRECONDITION");
+    expect(afterRetry.data()).toEqual(beforeRetry.data());
+  });
+
+  it(
+    "writes an adjustment and transactionally updates both bill rollups",
+    async () => {
+      const leaseId = await createBillingLease();
+      const rentChargeId = await addRentChargeDraft(leaseId);
+      const finalized = await callFunction(
+        "finalizeRentCharge",
+        fixture.landlord,
+        {rentChargeId}
+      );
+      expect(finalized.error).toBeUndefined();
+      await firestore().collection("rentCharges").doc(rentChargeId).update({
+        lateFineTotal: 100,
+        total: 142695,
+        status: "due",
+      });
+
+      const idempotencyKey = randomUUID();
+      const response = await callFunction(
+        "applyAdjustment",
+        fixture.landlord,
+        {
+          rentChargeId,
+          amount: -250,
+          reason: "Corrected electricity amount",
+          idempotencyKey,
+        }
+      );
+
+      expect(response.error).toBeUndefined();
+      expect(response.result).toMatchObject({
+        success: true,
+        adjustmentId: idempotencyKey,
+        newAdjustmentTotal: -250,
+        newTotal: 142445,
+      });
+      const [bill, adjustment] = await Promise.all([
+        firestore().collection("rentCharges").doc(rentChargeId).get(),
+        firestore()
+          .collection("rentCharges")
+          .doc(rentChargeId)
+          .collection("adjustments")
+          .doc(idempotencyKey)
+          .get(),
+      ]);
+      expect(bill.data()).toMatchObject({
+        subtotal: 142595,
+        lateFineTotal: 100,
+        adjustmentTotal: -250,
+        total: 142445,
+      });
+      expect(adjustment.data()).toMatchObject({
+        type: "correction",
+        amount: -250,
+        reason: "Corrected electricity amount",
+        createdBy: fixture.landlord.uid,
+        idempotencyKey,
+        createdAt: expect.any(admin.firestore.Timestamp),
+      });
+    }
+  );
+
+  it("makes concurrent adjustment retries idempotent", async () => {
+    const leaseId = await createBillingLease();
+    const rentChargeId = await addRentChargeDraft(leaseId);
+    await callFunction(
+      "finalizeRentCharge",
+      fixture.landlord,
+      {rentChargeId}
+    );
+    const idempotencyKey = "abcdef12-3456-7890-abcd-ef1234567890";
+    const input = {
+      rentChargeId,
+      amount: 500,
+      reason: "Verified additional utility charge",
+      idempotencyKey,
+    };
+
+    const [first, retry] = await Promise.all([
+      callFunction("applyAdjustment", fixture.landlord, input),
+      callFunction("applyAdjustment", fixture.landlord, {
+        ...input,
+        idempotencyKey: idempotencyKey.toUpperCase(),
+      }),
+    ]);
+
+    expect(first.error).toBeUndefined();
+    expect(retry.error).toBeUndefined();
+    expect(first.result?.adjustmentId).toBe(idempotencyKey);
+    expect(retry.result?.adjustmentId).toBe(idempotencyKey);
+    const [canonicalAdjustment, uppercaseAdjustment] = await Promise.all([
+      firestore()
+        .collection("rentCharges")
+        .doc(rentChargeId)
+        .collection("adjustments")
+        .doc(idempotencyKey)
+        .get(),
+      firestore()
+        .collection("rentCharges")
+        .doc(rentChargeId)
+        .collection("adjustments")
+        .doc(idempotencyKey.toUpperCase())
+        .get(),
+    ]);
+    expect(canonicalAdjustment.data()?.idempotencyKey).toBe(idempotencyKey);
+    expect(uppercaseAdjustment.exists).toBe(false);
+    const conflictingRetry = await callFunction(
+      "applyAdjustment",
+      fixture.landlord,
+      {...input, amount: 501}
+    );
+    expect(conflictingRetry.error?.status).toBe("ALREADY_EXISTS");
+    const [bill, adjustments] = await Promise.all([
+      firestore().collection("rentCharges").doc(rentChargeId).get(),
+      firestore()
+        .collection("rentCharges")
+        .doc(rentChargeId)
+        .collection("adjustments")
+        .get(),
+    ]);
+    expect(bill.data()?.adjustmentTotal).toBe(500);
+    expect(bill.data()?.total).toBe(143095);
+    expect(adjustments.size).toBe(1);
+  });
+
+  it("rejects adjustment callers without landlord ownership", async () => {
+    const leaseId = await createBillingLease();
+    const rentChargeId = await addRentChargeDraft(leaseId);
+    await callFunction("finalizeRentCharge", fixture.landlord, {rentChargeId});
+    const input = {
+      rentChargeId,
+      amount: 100,
+      reason: "Correction",
+      idempotencyKey: randomUUID(),
+    };
+
+    const [tenantResponse, otherLandlordResponse, unauthenticatedResponse] =
+      await Promise.all([
+        callFunction("applyAdjustment", fixture.tenant, input),
+        callFunction("applyAdjustment", fixture.otherLandlord, input),
+        callUnauthenticatedFunction("applyAdjustment", input),
+      ]);
+
+    expect(tenantResponse.error?.status).toBe("PERMISSION_DENIED");
+    expect(otherLandlordResponse.error?.status).toBe("PERMISSION_DENIED");
+    expect(unauthenticatedResponse.error?.status).toBe("UNAUTHENTICATED");
+    const [bill, adjustments] = await Promise.all([
+      firestore().collection("rentCharges").doc(rentChargeId).get(),
+      firestore()
+        .collection("rentCharges")
+        .doc(rentChargeId)
+        .collection("adjustments")
+        .get(),
+    ]);
+    expect(bill.data()?.total).toBe(142595);
+    expect(adjustments.empty).toBe(true);
+  });
+
+  it.each(["payment_pending", "paid"])(
+    "does not adjust a bill in %s status",
+    async (status) => {
+      const leaseId = await createBillingLease();
+      const rentChargeId = await addRentChargeDraft(leaseId);
+      await callFunction(
+        "finalizeRentCharge",
+        fixture.landlord,
+        {rentChargeId}
+      );
+      await firestore().collection("rentCharges").doc(rentChargeId).update({
+        status,
+      });
+      const before = await firestore()
+        .collection("rentCharges")
+        .doc(rentChargeId)
+        .get();
+
+      const response = await callFunction(
+        "applyAdjustment",
+        fixture.landlord,
+        {
+          rentChargeId,
+          amount: 100,
+          reason: "Correction",
+          idempotencyKey: randomUUID(),
+        }
+      );
+
+      expect(response.error?.status).toBe("FAILED_PRECONDITION");
+      const [after, adjustments] = await Promise.all([
+        firestore().collection("rentCharges").doc(rentChargeId).get(),
+        firestore()
+          .collection("rentCharges")
+          .doc(rentChargeId)
+          .collection("adjustments")
+          .get(),
+      ]);
+      expect(after.data()).toEqual(before.data());
+      expect(adjustments.empty).toBe(true);
+    }
+  );
+
+  it(
+    "rejects malformed adjustment inputs and inconsistent bill totals",
+    async () => {
+      const leaseId = await createBillingLease();
+      const rentChargeId = await addRentChargeDraft(leaseId);
+      await callFunction(
+        "finalizeRentCharge",
+        fixture.landlord,
+        {rentChargeId}
+      );
+      const invalidAmount = await callFunction(
+        "applyAdjustment",
+        fixture.landlord,
+        {
+          rentChargeId,
+          amount: 1.5,
+          reason: "Correction",
+          idempotencyKey: randomUUID(),
+        }
+      );
+      expect(invalidAmount.error?.status).toBe("INVALID_ARGUMENT");
+
+      await firestore().collection("rentCharges").doc(rentChargeId).update({
+        total: 1,
+      });
+      const response = await callFunction(
+        "applyAdjustment",
+        fixture.landlord,
+        {
+          rentChargeId,
+          amount: -10,
+          reason: "Correction",
+          idempotencyKey: randomUUID(),
+        }
+      );
+      expect(response.error?.status).toBe("FAILED_PRECONDITION");
+      const adjustments = await firestore()
+        .collection("rentCharges")
+        .doc(rentChargeId)
+        .collection("adjustments")
+        .get();
+      expect(adjustments.empty).toBe(true);
     }
   );
 });

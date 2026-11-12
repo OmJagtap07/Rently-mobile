@@ -574,3 +574,389 @@ export const endLease = onCall<EndLeaseInput>(
     });
   }
 );
+
+interface FinalizeRentChargeInput {
+  rentChargeId: string;
+}
+
+/**
+ * Checks whether a Firestore value is a non-array object.
+ * @param {unknown} value Value to check
+ * @return {boolean} Whether the value is a record
+ */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Checks the canonical billing-month representation.
+ * @param {unknown} value Candidate billing month
+ * @return {boolean} Whether the value is a valid YYYY-MM month
+ */
+function isBillingMonth(value: unknown): value is string {
+  return typeof value === "string" &&
+    /^(0[0-9]{3}|[1-9][0-9]{3})-(0[1-9]|1[0-2])$/.test(value);
+}
+
+/**
+ * Validates bill line items and totals their integer paise amounts.
+ * @param {unknown} value Draft line items
+ * @return {number} Sum of line-item amounts
+ */
+function calculateLineItemsSubtotal(value: unknown): number {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 10) {
+    throw new HttpsError(
+      "failed-precondition",
+      "Draft bill must contain between one and ten valid line items."
+    );
+  }
+
+  let subtotal = 0;
+  let rentLineItemCount = 0;
+  const allowedTypes = new Set(["rent", "electricity", "maintenance", "other"]);
+  for (const item of value) {
+    if (
+      !isRecord(item) ||
+      Object.keys(item).length !== 3 ||
+      !allowedTypes.has(item.type as string) ||
+      typeof item.label !== "string" ||
+      !item.label.trim() ||
+      !Number.isSafeInteger(item.amount) ||
+      (item.amount as number) < 0
+    ) {
+      throw new HttpsError(
+        "failed-precondition",
+        "Draft bill contains an invalid line item."
+      );
+    }
+
+    if (item.type === "rent") {
+      rentLineItemCount += 1;
+    }
+
+    subtotal += item.amount as number;
+    if (!Number.isSafeInteger(subtotal)) {
+      throw new HttpsError(
+        "failed-precondition",
+        "Draft bill total exceeds the supported integer range."
+      );
+    }
+  }
+
+  if (rentLineItemCount !== 1) {
+    throw new HttpsError(
+      "failed-precondition",
+      "Draft bill must contain exactly one rent line item."
+    );
+  }
+
+  return subtotal;
+}
+
+/**
+ * Finalizes a landlord-owned draft after validating its linked active tenancy.
+ */
+export const finalizeRentCharge = onCall<FinalizeRentChargeInput>(
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "User must be authenticated.");
+    }
+    requireRole(request.auth.token.role, "landlord");
+
+    const uid = request.auth.uid;
+    const {rentChargeId} = request.data || {};
+    if (
+      typeof rentChargeId !== "string" ||
+      !rentChargeId.trim() ||
+      rentChargeId.includes("/")
+    ) {
+      throw new HttpsError(
+        "invalid-argument",
+        "rentChargeId is required."
+      );
+    }
+
+    const rentChargeRef = db.collection("rentCharges").doc(rentChargeId.trim());
+    return await db.runTransaction(async (transaction) => {
+      const rentChargeDoc = await transaction.get(rentChargeRef);
+      if (!rentChargeDoc.exists) {
+        throw new HttpsError("not-found", "Rent charge not found.");
+      }
+
+      const rentCharge = rentChargeDoc.data()!;
+      if (rentCharge.landlordId !== uid) {
+        throw new HttpsError(
+          "permission-denied",
+          "Only the owning landlord can finalize this rent charge."
+        );
+      }
+      if (rentCharge.status !== "draft") {
+        throw new HttpsError(
+          "failed-precondition",
+          "Rent charge is not a draft."
+        );
+      }
+
+      const {leaseId, tenantId, propertyId, unitId, billingMonth} = rentCharge;
+      if (
+        typeof leaseId !== "string" || !leaseId ||
+        typeof tenantId !== "string" || !tenantId ||
+        typeof propertyId !== "string" || !propertyId ||
+        typeof unitId !== "string" || !unitId
+      ) {
+        throw new HttpsError(
+          "failed-precondition",
+          "Draft bill is missing a valid lease relationship."
+        );
+      }
+      if (!isBillingMonth(billingMonth)) {
+        throw new HttpsError(
+          "invalid-argument",
+          "billingMonth must be a valid YYYY-MM value."
+        );
+      }
+      if (rentChargeRef.id !== `${leaseId}_${billingMonth}`) {
+        throw new HttpsError(
+          "invalid-argument",
+          "Rent charge ID must match its lease and billing month."
+        );
+      }
+
+      const [leaseDoc, tenantDoc, propertyDoc, unitDoc] = await Promise.all([
+        transaction.get(db.collection("leases").doc(leaseId)),
+        transaction.get(db.collection("users").doc(tenantId)),
+        transaction.get(db.collection("properties").doc(propertyId)),
+        transaction.get(db.collection("units").doc(unitId)),
+      ]);
+      if (!leaseDoc.exists) {
+        throw new HttpsError("not-found", "Referenced lease not found.");
+      }
+      if (!tenantDoc.exists) {
+        throw new HttpsError("not-found", "Referenced tenant not found.");
+      }
+      if (!propertyDoc.exists) {
+        throw new HttpsError("not-found", "Referenced property not found.");
+      }
+      if (!unitDoc.exists) {
+        throw new HttpsError("not-found", "Referenced unit not found.");
+      }
+
+      const lease = leaseDoc.data()!;
+      const tenant = tenantDoc.data()!;
+      const property = propertyDoc.data()!;
+      const unit = unitDoc.data()!;
+      if (
+        lease.status !== "active" ||
+        lease.landlordId !== uid ||
+        lease.tenantId !== tenantId ||
+        lease.propertyId !== propertyId ||
+        lease.unitId !== unitId ||
+        tenant.role !== "tenant" ||
+        tenant.activeLeaseId !== leaseDoc.id ||
+        property.landlordId !== uid ||
+        unit.landlordId !== uid ||
+        unit.propertyId !== propertyId ||
+        unit.status !== "occupied" ||
+        unit.currentLeaseId !== leaseDoc.id
+      ) {
+        throw new HttpsError(
+          "failed-precondition",
+          "Draft bill references do not match an active lease."
+        );
+      }
+
+      const subtotal = calculateLineItemsSubtotal(rentCharge.lineItems);
+      if (
+        !Number.isSafeInteger(rentCharge.subtotal) ||
+        rentCharge.subtotal !== subtotal ||
+        !Number.isSafeInteger(rentCharge.total) ||
+        rentCharge.total !== subtotal ||
+        rentCharge.lateFineTotal !== 0 ||
+        rentCharge.adjustmentTotal !== 0
+      ) {
+        throw new HttpsError(
+          "failed-precondition",
+          "Draft bill totals do not match its line items."
+        );
+      }
+
+      const dueDate = `${billingMonth}-10`;
+      if (rentCharge.dueDate !== dueDate) {
+        throw new HttpsError(
+          "failed-precondition",
+          "Draft dueDate must be the 10th of its billing month."
+        );
+      }
+
+      const now = FieldValue.serverTimestamp();
+      transaction.update(rentChargeRef, {
+        status: "finalized",
+        finalizedAt: now,
+        finalizedBy: uid,
+        dueDate,
+        total: subtotal,
+        updatedAt: now,
+      });
+
+      return {
+        success: true,
+        rentChargeId: rentChargeRef.id,
+        dueDate,
+        total: subtotal,
+      };
+    });
+  }
+);
+
+interface ApplyAdjustmentInput {
+  rentChargeId: string;
+  amount: number;
+  reason: string;
+  idempotencyKey: string;
+}
+
+/**
+ * Applies an auditable correction without changing the original bill items.
+ */
+export const applyAdjustment = onCall<ApplyAdjustmentInput>(
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "User must be authenticated.");
+    }
+    requireRole(request.auth.token.role, "landlord");
+
+    const uid = request.auth.uid;
+    const {rentChargeId, amount, reason, idempotencyKey} = request.data || {};
+    if (
+      typeof rentChargeId !== "string" ||
+      !rentChargeId.trim() ||
+      rentChargeId.includes("/")
+    ) {
+      throw new HttpsError("invalid-argument", "rentChargeId is required.");
+    }
+    if (!Number.isSafeInteger(amount)) {
+      throw new HttpsError(
+        "invalid-argument",
+        "amount must be an integer number of paise."
+      );
+    }
+    if (typeof reason !== "string" || !reason.trim()) {
+      throw new HttpsError("invalid-argument", "reason is required.");
+    }
+    if (
+      typeof idempotencyKey !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+        .test(idempotencyKey)
+    ) {
+      throw new HttpsError(
+        "invalid-argument",
+        "idempotencyKey must be a UUID."
+      );
+    }
+
+    const normalizedIdempotencyKey = idempotencyKey.toLowerCase();
+    const rentChargeRef = db.collection("rentCharges").doc(rentChargeId.trim());
+    const adjustmentRef = rentChargeRef
+      .collection("adjustments")
+      .doc(normalizedIdempotencyKey);
+    const normalizedReason = reason.trim();
+
+    return await db.runTransaction(async (transaction) => {
+      const [rentChargeDoc, adjustmentDoc] = await Promise.all([
+        transaction.get(rentChargeRef),
+        transaction.get(adjustmentRef),
+      ]);
+      if (!rentChargeDoc.exists) {
+        throw new HttpsError("not-found", "Rent charge not found.");
+      }
+
+      const rentCharge = rentChargeDoc.data()!;
+      if (rentCharge.landlordId !== uid) {
+        throw new HttpsError(
+          "permission-denied",
+          "Only the owning landlord can adjust this rent charge."
+        );
+      }
+
+      if (adjustmentDoc.exists) {
+        const adjustment = adjustmentDoc.data()!;
+        if (
+          adjustment.amount !== amount ||
+          adjustment.reason !== normalizedReason ||
+          adjustment.createdBy !== uid
+        ) {
+          throw new HttpsError(
+            "already-exists",
+            "idempotencyKey was already used for a different adjustment."
+          );
+        }
+        return {
+          success: true,
+          adjustmentId: adjustmentDoc.id,
+          newAdjustmentTotal: rentCharge.adjustmentTotal,
+          newTotal: rentCharge.total,
+        };
+      }
+
+      if (!["finalized", "due", "overdue"].includes(rentCharge.status)) {
+        throw new HttpsError(
+          "failed-precondition",
+          rentCharge.status === "payment_pending" ?
+            "Adjustments are not allowed while payment is pending." :
+            rentCharge.status === "paid" ?
+              "Paid rent charges cannot be adjusted." :
+              "Rent charge must be finalized before it can be adjusted."
+        );
+      }
+
+      const {subtotal, lateFineTotal, adjustmentTotal, total} = rentCharge;
+      if (
+        !Number.isSafeInteger(subtotal) ||
+        !Number.isSafeInteger(lateFineTotal) ||
+        !Number.isSafeInteger(adjustmentTotal) ||
+        !Number.isSafeInteger(total) ||
+        !Number.isSafeInteger(subtotal + lateFineTotal + adjustmentTotal) ||
+        subtotal + lateFineTotal + adjustmentTotal !== total
+      ) {
+        throw new HttpsError(
+          "failed-precondition",
+          "Rent charge totals are inconsistent."
+        );
+      }
+
+      const newAdjustmentTotal = adjustmentTotal + amount;
+      const newTotal = subtotal + lateFineTotal + newAdjustmentTotal;
+      if (
+        !Number.isSafeInteger(newAdjustmentTotal) ||
+        !Number.isSafeInteger(newTotal)
+      ) {
+        throw new HttpsError(
+          "invalid-argument",
+          "Adjustment exceeds the supported integer range."
+        );
+      }
+
+      const now = FieldValue.serverTimestamp();
+      transaction.create(adjustmentRef, {
+        type: "correction",
+        amount,
+        reason: normalizedReason,
+        createdBy: uid,
+        idempotencyKey: normalizedIdempotencyKey,
+        createdAt: now,
+      });
+      transaction.update(rentChargeRef, {
+        adjustmentTotal: newAdjustmentTotal,
+        total: newTotal,
+        updatedAt: now,
+      });
+
+      return {
+        success: true,
+        adjustmentId: adjustmentRef.id,
+        newAdjustmentTotal,
+        newTotal,
+      };
+    });
+  }
+);

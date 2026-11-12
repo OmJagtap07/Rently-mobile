@@ -175,7 +175,9 @@ Deliberately excludes `joinCode`, `landlordId`, and any other field — this is 
 - `rentCharges/{id}` exists, `status == 'draft'`, `landlordId == caller.uid`.
 - Parent `leases.status == 'active'`.
 - `billingMonth` matches the ID's month segment (defense-in-depth against a malformed draft).
+- `lineItems` contains at most 10 entries and exactly one `rent` entry; each item is validated server-side.
 - `subtotal` recomputed server-side from `lineItems` and must match the stored `subtotal` (catches any client-side arithmetic drift before it becomes historical fact).
+- Draft `total` matches `subtotal`, and its precomputed `dueDate` is the 10th of `billingMonth`.
 - No other `rentCharges` doc already exists for this `leaseId` + `billingMonth` — the composite ID (schema.md §6) makes this a single existence check, not a query.
 
 **Transaction steps:**
@@ -183,7 +185,7 @@ Deliberately excludes `joinCode`, `landlordId`, and any other field — this is 
 
 **Result:** `{ rentChargeId: string, dueDate: string, total: number }`
 
-**Errors:** `failed-precondition` (not draft, lease not active, or subtotal mismatch), `already-exists` (shouldn't be reachable given the composite ID, but checked defensively), `not-found`, `permission-denied`.
+**Errors:** `failed-precondition` (not draft, lease not active, invalid line items, or subtotal mismatch), `already-exists` (shouldn't be reachable given the composite ID, but checked defensively), `not-found`, `permission-denied`.
 
 **Idempotency:** safe — retrying after success hits `failed-precondition` (`status` no longer `draft`).
 
@@ -233,14 +235,14 @@ Deliberately excludes `joinCode`, `landlordId`, and any other field — this is 
 - No existing `adjustments` doc with this `idempotencyKey` (same pattern as `applyManualFine`, needed for the same reason).
 
 **Transaction steps:**
-1. Create `rentCharges/{id}/adjustments/{newAdjustmentId}`: `type: 'correction'`, `amount`, `reason`, `idempotencyKey`, `createdBy = caller.uid`.
+1. Create `rentCharges/{id}/adjustments/{idempotencyKey}`: `type: 'correction'`, `amount`, `reason`, `idempotencyKey`, `createdBy = caller.uid`.
 2. `rentCharges/{id}.adjustmentTotal += amount`, `total += amount`.
 
 **Result:** `{ adjustmentId: string, newAdjustmentTotal: number, newTotal: number }`
 
-**Errors:** `failed-precondition` (status not in the allowed set — the error message should distinguish "payment pending" from "already paid" so the landlord UI can explain *why*, per design.md's "don't hide financial info" rule), `already-exists` (duplicate `idempotencyKey` — returns the original adjustment's result rather than erroring, same retry-safety pattern as `applyManualFine()`), `invalid-argument`, `not-found`, `permission-denied`.
+**Errors:** `failed-precondition` (status not in the allowed set — the error message should distinguish "payment pending" from "already paid" so the landlord UI can explain *why*, per design.md's "don't hide financial info" rule), `already-exists` (the key was reused with a different payload), `invalid-argument`, `not-found`, `permission-denied`.
 
-**Idempotency:** via `idempotencyKey`, as above — this function's contract was already correct in v1.0; `applyManualFine()` has now been brought in line with it.
+**Idempotency:** `idempotencyKey` is a UUID, normalized to lowercase, and used as the adjustment document ID and persisted value. A retry with the same key and payload (including a case variant) does not write again; it returns the existing adjustment ID and the bill's current rollup totals. Reusing the key with a different payload returns `already-exists`.
 
 ---
 
