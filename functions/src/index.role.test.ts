@@ -2,6 +2,7 @@ import testEnvFactory from "firebase-functions-test";
 import {
   acceptJoinRequest,
   createJoinRequest,
+  endLease,
   getPendingRequestAvailability,
   resolveJoinCode,
 } from "./index";
@@ -11,6 +12,7 @@ const testEnv = testEnvFactory({projectId: "demo-rently"});
 const wrapped = {
   acceptJoinRequest: testEnv.wrap(acceptJoinRequest),
   createJoinRequest: testEnv.wrap(createJoinRequest),
+  endLease: testEnv.wrap(endLease),
   getPendingRequestAvailability: testEnv.wrap(
     getPendingRequestAvailability
   ),
@@ -107,4 +109,27 @@ describe("callable role authorization", () => {
       ).rejects.toThrow("Only tenants can perform this action.");
     }
   );
+
+  it("allows landlords to end leases", async () => {
+    await expect(
+      wrapped.endLease(request("landlord"))
+    ).rejects.toThrow("leaseId is required.");
+  });
+
+  it("denies tenants from ending leases", async () => {
+    await expect(
+      wrapped.endLease(request("tenant"))
+    ).rejects.toThrow("Only landlords can perform this action.");
+  });
+
+  it("rejects unauthenticated callers from ending leases", async () => {
+    const unauthenticatedRequest = {
+      ...request("tenant"),
+      auth: undefined,
+    };
+
+    await expect(
+      wrapped.endLease(unauthenticatedRequest)
+    ).rejects.toThrow("User must be authenticated.");
+  });
 });

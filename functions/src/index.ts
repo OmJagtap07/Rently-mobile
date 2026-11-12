@@ -538,6 +538,7 @@ export const endLease = onCall<EndLeaseInput>(
         "User must be authenticated."
       );
     }
+    requireRole(request.auth.token.role, "landlord");
     const uid = request.auth.uid;
 
     const {leaseId, endDate, endReason} = request.data || {};
