@@ -111,6 +111,24 @@ async function callFunction(
 }
 
 /**
+ * Invokes a callable through the Functions emulator without an ID token.
+ * @param {string} name Callable function name
+ * @param {Record<string, unknown>} data Callable input
+ * @return {Promise<CallableResponse>} Callable protocol response
+ */
+async function callUnauthenticatedFunction(
+  name: string,
+  data: Record<string, unknown>
+): Promise<CallableResponse> {
+  const response = await fetch(`${functionsEmulatorUrl}/${name}`, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({data}),
+  });
+  return await response.json() as CallableResponse;
+}
+
+/**
  * Seeds a pending join request for an acceptance test.
  * @param {string} tenantId Requesting tenant UID
  * @param {string} propertyId Target property ID
@@ -150,6 +168,42 @@ async function createTenantProfile(tenant: TestUser): Promise<void> {
     email: "phase3@example.test",
     activeLeaseId: null,
   });
+}
+
+/**
+ * Seeds an active lease and synchronizes its unit and tenant references.
+ * @return {Promise<string>} New active lease ID
+ */
+async function seedActiveLease(): Promise<string> {
+  const db = firestore();
+  const leaseRef = db.collection("leases").doc();
+  const now = admin.firestore.FieldValue.serverTimestamp();
+
+  await Promise.all([
+    leaseRef.set({
+      tenantId: fixture.tenant.uid,
+      tenantName: "Phase 3 Tenant",
+      tenantPhone: "555-0100",
+      landlordId: fixture.landlord.uid,
+      propertyId: fixture.propertyId,
+      propertyName: "Phase 3 Property",
+      unitId: fixture.vacantUnitId,
+      roomNumber: "302",
+      joiningDate: "2026-01-01",
+      currentBaseRent: 125000,
+      status: "active",
+      createdAt: now,
+      updatedAt: now,
+    }),
+    db.collection("units").doc(fixture.vacantUnitId).update({
+      status: "occupied",
+      currentLeaseId: leaseRef.id,
+    }),
+    db.collection("users").doc(fixture.tenant.uid).update({
+      activeLeaseId: leaseRef.id,
+    }),
+  ]);
+  return leaseRef.id;
 }
 
 /**
@@ -201,8 +255,8 @@ async function cleanupFixture(): Promise<void> {
 }
 
 beforeAll(() => {
-  return import("firebase-admin").then((firebaseAdmin) => {
-    admin = firebaseAdmin;
+  return import("firebase-admin").then((firebaseAdminModule) => {
+    admin = firebaseAdminModule.default;
     if (admin.apps.length) return;
     admin.initializeApp({projectId});
   });
@@ -421,6 +475,237 @@ describe("createJoinRequest emulator integration", () => {
   });
 });
 
+describe(
+  "getPendingRequestAvailability emulator integration",
+  () => {
+    it(
+      "reports when a pending request has vacant units",
+      async () => {
+        await addJoinRequest(
+          fixture.tenant.uid,
+          fixture.propertyId,
+          fixture.landlord.uid,
+          "Phase 3 Property"
+        );
+
+        const response = await callFunction(
+          "getPendingRequestAvailability",
+          fixture.tenant,
+          {propertyId: fixture.propertyId}
+        );
+
+        expect(response.error).toBeUndefined();
+        expect(response.result?.hasVacantUnits).toBe(true);
+      }
+    );
+
+    it(
+      "reports when every unit for a pending request is occupied",
+      async () => {
+        await addJoinRequest(
+          fixture.tenant.uid,
+          fixture.propertyId,
+          fixture.landlord.uid,
+          "Phase 3 Property"
+        );
+        await firestore().collection("units")
+          .doc(fixture.vacantUnitId).update({
+            status: "occupied",
+          });
+
+        const response = await callFunction(
+          "getPendingRequestAvailability",
+          fixture.tenant,
+          {propertyId: fixture.propertyId}
+        );
+
+        expect(response.error).toBeUndefined();
+        expect(response.result?.hasVacantUnits).toBe(false);
+      }
+    );
+
+    it(
+      "does not disclose availability without a pending request",
+      async () => {
+        const response = await callFunction(
+          "getPendingRequestAvailability",
+          fixture.tenant,
+          {propertyId: fixture.propertyId}
+        );
+
+        expect(response.error?.status).toBe("FAILED_PRECONDITION");
+      }
+    );
+
+    it("rejects a landlord caller", async () => {
+      const response = await callFunction(
+        "getPendingRequestAvailability",
+        fixture.landlord,
+        {propertyId: fixture.propertyId}
+      );
+
+      expect(response.error?.status).toBe("PERMISSION_DENIED");
+    });
+  }
+);
+
+describe("endLease emulator integration", () => {
+  it(
+    "preserves the lease and atomically releases tenant and unit",
+    async () => {
+      const leaseId = await seedActiveLease();
+      const endDate = "2026-02-01";
+      const endReason = "Tenant moved out";
+
+      const response = await callFunction(
+        "endLease",
+        fixture.landlord,
+        {leaseId, endDate, endReason}
+      );
+
+      expect(response.error).toBeUndefined();
+      expect(response.result).toMatchObject({
+        success: true,
+        leaseId,
+        status: "ended",
+      });
+
+      const [lease, unit, tenant] = await Promise.all([
+        firestore().collection("leases").doc(leaseId).get(),
+        firestore().collection("units").doc(fixture.vacantUnitId).get(),
+        firestore().collection("users").doc(fixture.tenant.uid).get(),
+      ]);
+
+      expect(lease.exists).toBe(true);
+      expect(lease.data()).toMatchObject({
+        status: "ended",
+        endDate,
+        endReason,
+        endedBy: fixture.landlord.uid,
+      });
+      expect(unit.data()).toMatchObject({
+        status: "vacant",
+        currentLeaseId: null,
+      });
+      expect(tenant.data()?.activeLeaseId).toBeNull();
+    }
+  );
+
+  it(
+    "rejects a tenant without changing lease, unit, or tenant",
+    async () => {
+      const leaseId = await seedActiveLease();
+      const refs = [
+        firestore().collection("leases").doc(leaseId),
+        firestore().collection("units").doc(fixture.vacantUnitId),
+        firestore().collection("users").doc(fixture.tenant.uid),
+      ];
+      const before = await Promise.all(refs.map((ref) => ref.get()));
+
+      const response = await callFunction(
+        "endLease",
+        fixture.tenant,
+        {leaseId, endDate: "2026-02-01", endReason: "Unauthorized"}
+      );
+
+      expect(response.error?.status).toBe("PERMISSION_DENIED");
+      const after = await Promise.all(refs.map((ref) => ref.get()));
+      after.forEach((snapshot, index) => {
+        expect(snapshot.data()).toEqual(before[index].data());
+      });
+    }
+  );
+
+  it(
+    "rejects an unauthenticated caller without changing lease, unit, or tenant",
+    async () => {
+      const leaseId = await seedActiveLease();
+      const refs = [
+        firestore().collection("leases").doc(leaseId),
+        firestore().collection("units").doc(fixture.vacantUnitId),
+        firestore().collection("users").doc(fixture.tenant.uid),
+      ];
+      const before = await Promise.all(refs.map((ref) => ref.get()));
+
+      const response = await callUnauthenticatedFunction(
+        "endLease",
+        {leaseId, endDate: "2026-02-01", endReason: "Unauthenticated"}
+      );
+
+      expect(response.error?.status).toBe("UNAUTHENTICATED");
+      const after = await Promise.all(refs.map((ref) => ref.get()));
+      after.forEach((snapshot, index) => {
+        expect(snapshot.data()).toEqual(before[index].data());
+      });
+    }
+  );
+
+  it(
+    "keeps the ended lease while the tenant receives a distinct new lease",
+    async () => {
+      const endedLeaseId = await seedActiveLease();
+      const endDate = "2026-02-01";
+      const endReason = "Tenant moved out";
+
+      const termination = await callFunction(
+        "endLease",
+        fixture.landlord,
+        {leaseId: endedLeaseId, endDate, endReason}
+      );
+      expect(termination.error).toBeUndefined();
+      const endedLeaseBeforeRelet = await firestore()
+        .collection("leases")
+        .doc(endedLeaseId)
+        .get();
+      const endedLeaseData = endedLeaseBeforeRelet.data();
+
+      const requestId = await addJoinRequest(
+        fixture.tenant.uid,
+        fixture.propertyId,
+        fixture.landlord.uid,
+        "Phase 3 Property"
+      );
+      const acceptance = await callFunction(
+        "acceptJoinRequest",
+        fixture.landlord,
+        {joinRequestId: requestId, unitId: fixture.vacantUnitId}
+      );
+
+      expect(acceptance.error).toBeUndefined();
+      const newLeaseId = acceptance.result?.leaseId as string;
+      expect(newLeaseId).toBeTruthy();
+      expect(newLeaseId).not.toBe(endedLeaseId);
+
+      const [endedLeaseAfterRelet, newLease, tenantLeases] = await Promise.all([
+        firestore().collection("leases").doc(endedLeaseId).get(),
+        firestore().collection("leases").doc(newLeaseId).get(),
+        firestore().collection("leases")
+          .where("tenantId", "==", fixture.tenant.uid)
+          .get(),
+      ]);
+
+      expect(endedLeaseAfterRelet.exists).toBe(true);
+      expect(endedLeaseAfterRelet.data()).toEqual(endedLeaseData);
+      expect(endedLeaseAfterRelet.data()).toMatchObject({
+        status: "ended",
+        endDate,
+        endReason,
+        endedBy: fixture.landlord.uid,
+      });
+      expect(newLease.exists).toBe(true);
+      expect(newLease.data()).toMatchObject({
+        tenantId: fixture.tenant.uid,
+        status: "active",
+        unitId: fixture.vacantUnitId,
+      });
+      expect(tenantLeases.docs.map((doc) => doc.id)).toEqual(
+        expect.arrayContaining([endedLeaseId, newLeaseId])
+      );
+      expect(tenantLeases.size).toBe(2);
+    }
+  );
+});
+
 describe("acceptJoinRequest emulator integration", () => {
   it(
     "creates an active lease, occupies the unit, links the tenant, " +
@@ -598,6 +883,14 @@ describe("acceptJoinRequest emulator integration", () => {
         .get();
       expect(thirdRequest.data()?.status).toBe("pending");
 
+      const noAvailability = await callFunction(
+        "getPendingRequestAvailability",
+        thirdTenant,
+        {propertyId: fixture.propertyId}
+      );
+      expect(noAvailability.error).toBeUndefined();
+      expect(noAvailability.result?.hasVacantUnits).toBe(false);
+
       const releasedLease = await callFunction(
         "endLease",
         fixture.landlord,
@@ -607,6 +900,14 @@ describe("acceptJoinRequest emulator integration", () => {
         }
       );
       expect(releasedLease.error).toBeUndefined();
+
+      const availabilityAfterMoveOut = await callFunction(
+        "getPendingRequestAvailability",
+        thirdTenant,
+        {propertyId: fixture.propertyId}
+      );
+      expect(availabilityAfterMoveOut.error).toBeUndefined();
+      expect(availabilityAfterMoveOut.result?.hasVacantUnits).toBe(true);
 
       const finalAcceptance = await callFunction(
         "acceptJoinRequest",
@@ -629,6 +930,21 @@ describe("acceptJoinRequest emulator integration", () => {
       expect(assignedUnit.data()?.currentLeaseId).toBe(
         finalAcceptance.result?.leaseId
       );
+      const thirdTenantProfile = await firestore()
+        .collection("users")
+        .doc(thirdTenant.uid)
+        .get();
+      expect(thirdTenantProfile.data()?.activeLeaseId).toBe(
+        finalAcceptance.result?.leaseId
+      );
+
+      const availabilityAfterAcceptance = await callFunction(
+        "getPendingRequestAvailability",
+        thirdTenant,
+        {propertyId: fixture.propertyId}
+      );
+      expect(availabilityAfterAcceptance.error?.status)
+        .toBe("FAILED_PRECONDITION");
     }
   );
 });

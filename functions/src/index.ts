@@ -288,6 +288,60 @@ export const createJoinRequest = onCall<CreateJoinRequestInput>(
   }
 );
 
+interface GetPendingRequestAvailabilityInput {
+  propertyId: string;
+}
+
+/**
+ * Returns whether a tenant's pending request property has any vacant units.
+ * The Admin SDK reads unit documents so tenants do not gain direct unit access.
+ */
+export const getPendingRequestAvailability =
+  onCall<GetPendingRequestAvailabilityInput>(async (request) => {
+    if (!request.auth) {
+      throw new HttpsError(
+        "unauthenticated",
+        "User must be authenticated."
+      );
+    }
+    requireRole(request.auth.token.role, "tenant");
+
+    const {propertyId} = request.data || {};
+    if (!propertyId || typeof propertyId !== "string" || !propertyId.trim()) {
+      throw new HttpsError(
+        "invalid-argument",
+        "propertyId is required."
+      );
+    }
+
+    const trimmedPropertyId = propertyId.trim();
+    const pendingRequest = await db
+      .collection("joinRequests")
+      .where("tenantId", "==", request.auth.uid)
+      .where("propertyId", "==", trimmedPropertyId)
+      .where("status", "==", "pending")
+      .limit(1)
+      .get();
+
+    if (pendingRequest.empty) {
+      throw new HttpsError(
+        "failed-precondition",
+        "A pending join request for this property is required."
+      );
+    }
+
+    const landlordId = pendingRequest.docs[0].data().landlordId;
+    const vacantUnits = await db
+      .collection("units")
+      .where("landlordId", "==", landlordId)
+      .where("propertyId", "==", trimmedPropertyId)
+      .where("status", "==", "vacant")
+      .limit(1)
+      .get();
+
+    return {hasVacantUnits: !vacantUnits.empty};
+  });
+
 interface AcceptJoinRequestInput {
   joinRequestId: string;
   unitId: string;
@@ -484,6 +538,7 @@ export const endLease = onCall<EndLeaseInput>(
         "User must be authenticated."
       );
     }
+    requireRole(request.auth.token.role, "landlord");
     const uid = request.auth.uid;
 
     const {leaseId, endDate, endReason} = request.data || {};

@@ -7,14 +7,136 @@ import '../auth/auth_service.dart';
 import '../services/property_service.dart';
 
 class PendingJoinRequestAvailabilityMessage extends StatelessWidget {
-  const PendingJoinRequestAvailabilityMessage({super.key});
+  final Stream<bool> availabilityStream;
+
+  const PendingJoinRequestAvailabilityMessage({
+    super.key,
+    required this.availabilityStream,
+  });
 
   @override
   Widget build(BuildContext context) {
-    return const Text(
-      "All units are currently rented out. Your request is still pending. "
-      "We'll assign you a unit when one becomes available.",
-      style: TextStyle(fontSize: 13),
+    return StreamBuilder<bool>(
+      stream: availabilityStream,
+      builder: (context, snapshot) {
+        final message = snapshot.hasError
+            ? 'Could not check unit availability. Your request is still pending.'
+            : snapshot.data == null
+            ? 'Checking unit availability...'
+            : snapshot.data!
+            ? 'Your request is pending landlord approval. A unit will be '
+                  'assigned if your request is accepted.'
+            : "All units are currently rented out. Your request is still "
+                  "pending. We'll assign you a unit when one becomes available.";
+        return Text(message, style: const TextStyle(fontSize: 13));
+      },
+    );
+  }
+}
+
+class TenantPreviousLeaseHistorySection extends StatelessWidget {
+  final String tenantId;
+  final Stream<List<Map<String, dynamic>>> leasesStream;
+
+  const TenantPreviousLeaseHistorySection({
+    super.key,
+    required this.tenantId,
+    required this.leasesStream,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<List<Map<String, dynamic>>>(
+      stream: leasesStream,
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Padding(
+            padding: EdgeInsets.all(16),
+            child: Center(child: CircularProgressIndicator()),
+          );
+        }
+
+        if (snapshot.hasError) {
+          return const Padding(
+            padding: EdgeInsets.symmetric(vertical: 12),
+            child: Text('Unable to load previous leases.'),
+          );
+        }
+
+        final previousLeases =
+            snapshot.data?.where((data) {
+              return data['tenantId'] == tenantId && data['status'] == 'ended';
+            }).toList() ??
+            [];
+
+        if (previousLeases.isEmpty) return const SizedBox.shrink();
+
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const SizedBox(height: 24),
+            const Text(
+              'Previous Leases',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 12),
+            ...previousLeases.map((data) {
+              final rentPaise = (data['currentBaseRent'] as num?)?.toInt() ?? 0;
+              final rentRupees = (rentPaise / 100).toStringAsFixed(0);
+              final propertyName = data['propertyName'] ?? 'Property';
+              final roomNumber = data['roomNumber'] ?? 'Not specified';
+              final joiningDate = data['joiningDate'] ?? 'Unknown';
+              final endDate = data['endDate'] ?? 'Unknown';
+
+              return Card(
+                child: ListTile(
+                  leading: const CircleAvatar(child: Icon(Icons.history)),
+                  title: Text(
+                    propertyName.toString(),
+                    style: const TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  subtitle: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('Room $roomNumber'),
+                      Text('Joined: $joiningDate'),
+                      Text('Ended: $endDate'),
+                      Text('Base Rent: ₹$rentRupees / month'),
+                    ],
+                  ),
+                ),
+              );
+            }),
+          ],
+        );
+      },
+    );
+  }
+}
+
+class TenantActiveTenancyContent extends StatelessWidget {
+  final List<Widget> activeLeaseChildren;
+  final String tenantId;
+  final Stream<List<Map<String, dynamic>>> leasesStream;
+
+  const TenantActiveTenancyContent({
+    super.key,
+    required this.activeLeaseChildren,
+    required this.tenantId,
+    required this.leasesStream,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        ...activeLeaseChildren,
+        TenantPreviousLeaseHistorySection(
+          tenantId: tenantId,
+          leasesStream: leasesStream,
+        ),
+      ],
     );
   }
 }
@@ -264,9 +386,13 @@ class _TenantDashboardScreenState extends State<TenantDashboardScreen> {
 
             return SingleChildScrollView(
               padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
+              child: TenantActiveTenancyContent(
+                tenantId: _uid!,
+                leasesStream: _propertyService.getTenantLeasesStream().map(
+                  (snapshot) =>
+                      snapshot.docs.map((lease) => lease.data()).toList(),
+                ),
+                activeLeaseChildren: [
                   Card(
                     elevation: 3,
                     shape: RoundedRectangleBorder(
@@ -489,6 +615,7 @@ class _TenantDashboardScreenState extends State<TenantDashboardScreen> {
                   final data = requests[index].data();
                   final propertyName = data['propertyName'] ?? 'Property';
                   final status = data['status'] ?? 'pending';
+                  final propertyId = data['propertyId'] as String?;
 
                   Color badgeColor;
                   Color textColor;
@@ -524,7 +651,19 @@ class _TenantDashboardScreenState extends State<TenantDashboardScreen> {
                           Text('Status: $label'),
                           if (status == 'pending') ...[
                             const SizedBox(height: 4),
-                            const PendingJoinRequestAvailabilityMessage(),
+                            if (propertyId != null && propertyId.isNotEmpty)
+                              PendingJoinRequestAvailabilityMessage(
+                                availabilityStream: _propertyService
+                                    .watchPendingRequestAvailability(
+                                      propertyId,
+                                    ),
+                              )
+                            else
+                              const Text(
+                                'Could not check unit availability. '
+                                'Your request is still pending.',
+                                style: TextStyle(fontSize: 13),
+                              ),
                           ],
                         ],
                       ),
@@ -551,6 +690,12 @@ class _TenantDashboardScreenState extends State<TenantDashboardScreen> {
                 },
               );
             },
+          ),
+          TenantPreviousLeaseHistorySection(
+            tenantId: _uid!,
+            leasesStream: _propertyService.getTenantLeasesStream().map(
+              (snapshot) => snapshot.docs.map((lease) => lease.data()).toList(),
+            ),
           ),
         ],
       ),
