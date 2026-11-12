@@ -177,6 +177,15 @@ No cross-document consequences, so still entirely 🟢 — but hard delete is re
 
 Neither role should ever be able to write a notification claiming to be "for" another user, so creation is fully server-side.
 
+### Device tokens and delivery outbox
+
+`users/{uid}/deviceTokens/{tokenHash}` and
+`notificationDeliveries/{notificationId}` (including its `devices` subcollection)
+are server-only. Clients register or unregister only their own FCM token through
+authenticated `registerDeviceToken()` / `unregisterDeviceToken()` callables;
+Rules deny direct reads and writes to token and delivery records. Scheduled and
+delivery functions use Admin SDK transactions and writes.
+
 ---
 
 ## 10. Cloud-Function-only operations (summary)

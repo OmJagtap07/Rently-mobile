@@ -280,7 +280,7 @@ Kept deliberately simple/flat otherwise — nothing in the source docs asks for 
 
 ## 9. `notifications`
 
-**Document ID:** auto-generated
+**Document ID:** auto-generated for action notifications; scheduled billing notifications use deterministic IDs so scheduler retries do not duplicate them.
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
@@ -298,6 +298,28 @@ Kept deliberately simple/flat otherwise — nothing in the source docs asks for 
 `prepare_bill_reminder`, `payment_proof_submitted`, `overdue_rent`, `rent_due`, `payment_accepted`, `payment_rejected`, `late_fine_update`.
 
 All rows are written by scheduled backend functions or by the accept/reject/submit actions server-side — never directly by a client claiming "notify this user."
+
+### Device-token and delivery records
+
+FCM tokens are stored under `users/{uid}/deviceTokens/{tokenHash}`. The hash is
+SHA-256 of the token; the document stores the token, platform, and server
+timestamps. Only authenticated `registerDeviceToken()` and
+`unregisterDeviceToken()` calls may modify these records; direct client reads
+and writes are denied. Multiple devices are represented by separate token-hash
+documents.
+
+`notificationDeliveries/{notificationId}` is a server-only transactional
+outbox associated with a durable notification document. It records the
+recipient and fan-out status. Per-device retry records live at
+`notificationDeliveries/{notificationId}/devices/{tokenHash}` and track
+delivery status, attempts, a short claim lease, the next retry time, and
+inspectable terminal failure details. These operational records are separate
+from `notifications`, whose frozen fields are unchanged. Delivery attempts are
+bounded to five with exponential backoff from one minute up to six hours. A
+five-minute UTC recovery worker retries due records and reclaims expired
+processing leases. Delivery remains at-least-once: a duplicate push is
+possible if FCM accepts a push but its acknowledgment is lost before success is
+recorded; exactly-once push delivery is not claimed.
 
 ---
 

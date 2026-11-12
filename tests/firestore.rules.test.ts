@@ -209,6 +209,34 @@ describe('3. properties', () => {
   });
 });
 
+describe('3a. server-only notification delivery data', () => {
+  it('denies clients reading or writing device tokens', async () => {
+    const db = getContext('tenant', 'tenantA').firestore();
+    const tokenRef = doc(db, 'users', 'tenantA', 'deviceTokens', 'tokenHash');
+
+    await assertFails(getDoc(tokenRef));
+    await assertFails(setDoc(tokenRef, { token: 'secret-token' }));
+    await assertFails(deleteDoc(tokenRef));
+  });
+
+  it('denies clients reading or writing notification delivery records', async () => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    const deliveryRef = doc(db, 'notificationDeliveries', 'notificationA');
+    const deviceDeliveryRef = doc(
+      db,
+      'notificationDeliveries',
+      'notificationA',
+      'devices',
+      'tokenHash'
+    );
+
+    await assertFails(getDoc(deliveryRef));
+    await assertFails(setDoc(deliveryRef, { status: 'pending' }));
+    await assertFails(getDoc(deviceDeliveryRef));
+    await assertFails(setDoc(deviceDeliveryRef, { status: 'pending' }));
+  });
+});
+
 describe('4. units', () => {
   it('U2-1 landlordA Create unit under own property -> ALLOW', async () => {
     const db = getContext('landlord', 'landlordA').firestore();

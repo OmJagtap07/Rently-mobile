@@ -1,8 +1,19 @@
 import {setGlobalOptions} from "firebase-functions";
 import {onCall, HttpsError} from "firebase-functions/v2/https";
+import {onSchedule} from "firebase-functions/v2/scheduler";
+import {onDocumentCreated} from "firebase-functions/v2/firestore";
 import {initializeApp, getApps} from "firebase-admin/app";
 import {getFirestore, FieldValue} from "firebase-admin/firestore";
 import {getAuth} from "firebase-admin/auth";
+import {getMessaging} from "firebase-admin/messaging";
+import {
+  deliverNotificationToDevice,
+  deviceTokenDocumentId,
+  expandNotificationDeliveries,
+  recoverNotificationDeliveries as recoverNotificationDeliveryTasks,
+  run1stTenantNotifications,
+  run25thLandlordReminder,
+} from "./billing_notifications";
 
 if (!getApps().length) {
   initializeApp();
@@ -960,3 +971,197 @@ export const applyAdjustment = onCall<ApplyAdjustmentInput>(
     });
   }
 );
+
+/** Input accepted by authenticated device-token callables. */
+interface DeviceTokenInput {
+  expectedUid: string;
+  token: string;
+  platform: "android" | "ios" | "web";
+}
+
+/**
+ * Validates token input before deriving a user-scoped document path.
+ * @param {unknown} data Untrusted callable data
+ * @return {DeviceTokenInput} Validated token and platform
+ */
+function validateDeviceTokenInput(data: unknown): DeviceTokenInput {
+  const input = data as Partial<DeviceTokenInput> | null;
+  if (typeof input?.expectedUid !== "string" ||
+      input.expectedUid.trim().length === 0) {
+    throw new HttpsError(
+      "invalid-argument",
+      "An expected authenticated user is required."
+    );
+  }
+  if (
+    typeof input?.token !== "string" ||
+    input.token.trim().length < 20 ||
+    input.token.length > 4096
+  ) {
+    throw new HttpsError(
+      "invalid-argument",
+      "A valid FCM token is required."
+    );
+  }
+  if (!["android", "ios", "web"].includes(input.platform as string)) {
+    throw new HttpsError(
+      "invalid-argument",
+      "A supported platform is required."
+    );
+  }
+  return {
+    expectedUid: input.expectedUid,
+    token: input.token,
+    platform: input.platform as DeviceTokenInput["platform"],
+  };
+}
+
+/**
+ * Stores an FCM token under the authenticated user's private device-token path.
+ */
+export const registerDeviceToken = onCall<DeviceTokenInput>(
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "User must be authenticated.");
+    }
+    const {expectedUid, token, platform} =
+      validateDeviceTokenInput(request.data);
+    if (expectedUid !== request.auth.uid) {
+      throw new HttpsError(
+        "permission-denied",
+        "The authenticated user changed during token registration."
+      );
+    }
+    const userRef = db.collection("users").doc(request.auth.uid);
+    const tokenRef = userRef.collection("deviceTokens")
+      .doc(deviceTokenDocumentId(token));
+
+    await db.runTransaction(async (transaction) => {
+      const [user, existingToken] = await Promise.all([
+        transaction.get(userRef),
+        transaction.get(tokenRef),
+      ]);
+      if (!user.exists || !["landlord", "tenant"].includes(user.get("role"))) {
+        throw new HttpsError(
+          "failed-precondition",
+          "Complete onboarding before registering notifications."
+        );
+      }
+
+      const now = FieldValue.serverTimestamp();
+      transaction.set(tokenRef, {
+        token,
+        platform,
+        createdAt: existingToken.exists ?
+          existingToken.get("createdAt") : now,
+        updatedAt: now,
+      });
+    });
+
+    return {success: true};
+  }
+);
+
+/**
+ * Removes only the current authenticated user's registered device token.
+ */
+export const unregisterDeviceToken = onCall<{
+  expectedUid: string;
+  token: string;
+}>(
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "User must be authenticated.");
+    }
+    const {expectedUid, token} = validateDeviceTokenInput({
+      expectedUid: request.data?.expectedUid,
+      token: request.data?.token,
+      platform: "android",
+    });
+    if (expectedUid !== request.auth.uid) {
+      throw new HttpsError(
+        "permission-denied",
+        "The authenticated user changed before token removal."
+      );
+    }
+    await db.collection("users")
+      .doc(request.auth.uid)
+      .collection("deviceTokens")
+      .doc(deviceTokenDocumentId(token))
+      .delete();
+    return {success: true};
+  }
+);
+
+export const send25thLandlordReminder = onSchedule(
+  {
+    schedule: "0 9 25 * *",
+    timeZone: "Etc/UTC",
+    retryCount: 3,
+    maxRetrySeconds: 7200,
+  },
+  async (event) => {
+    await run25thLandlordReminder(db, event.scheduleTime);
+  }
+);
+
+export const send1stTenantNotifications = onSchedule(
+  {
+    schedule: "0 9 1 * *",
+    timeZone: "Etc/UTC",
+    retryCount: 3,
+    maxRetrySeconds: 7200,
+  },
+  async (event) => {
+    await run1stTenantNotifications(db, event.scheduleTime);
+  }
+);
+
+export const expandNotificationDelivery = onDocumentCreated(
+  {
+    document: "notificationDeliveries/{notificationId}",
+    retry: true,
+  },
+  async (event) => {
+    const notificationId = event.params.notificationId;
+    await expandNotificationDeliveries(db, notificationId);
+  }
+);
+
+export const deliverNotificationToRegisteredDevice = onDocumentCreated(
+  {
+    document: "notificationDeliveries/{notificationId}/devices/{tokenHash}",
+    retry: true,
+  },
+  async (event) => {
+    await deliverNotificationToDevice(
+      db,
+      {
+        notificationId: event.params.notificationId,
+        tokenHash: event.params.tokenHash,
+      },
+      (message) => getMessaging().send(message)
+    );
+  }
+);
+
+export const recoverNotificationDeliveries = onSchedule(
+  {
+    schedule: "every 5 minutes",
+    timeZone: "Etc/UTC",
+    retryCount: 1,
+    maxRetrySeconds: 300,
+  },
+  async () => {
+    await recoverNotificationDeliveryTasks(
+      db,
+      (message) => getMessaging().send(message)
+    );
+  }
+);
+
+export {
+  deviceTokenDocumentId,
+  run1stTenantNotifications,
+  run25thLandlordReminder,
+};

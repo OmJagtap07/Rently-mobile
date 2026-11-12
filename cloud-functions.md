@@ -399,14 +399,61 @@ Deliberately excludes `joinCode`, `landlordId`, and any other field — this is 
 ## 14. Scheduled functions
 
 ### `send25thLandlordReminder`
-**Trigger:** scheduled, monthly on the 25th.
-**Logic:** for every `leases` with `status == 'active'`, create a `notifications` doc for the landlord (`type: 'prepare_bill_reminder'`). No Firestore writes outside `notifications` — this never touches `rentCharges` (architecture.md §8: no bill is auto-generated here).
-**Idempotency:** guard against double-firing (e.g. a retried Cloud Scheduler invocation) by keying the notification's existence check on `recipientId + type + billingMonth` before creating a duplicate.
+**Trigger:** scheduled, monthly on the 25th at 09:00 UTC.
+**Logic:** group active leases by landlord and create one `notifications` doc for each landlord (`type: 'prepare_bill_reminder'`) for the following UTC billing month. It also creates a server-only delivery outbox record. The notification ID is a deterministic hash of `recipientId + type + upcoming billingMonth`; no `billingMonth` field is added to the notification. This function never reads or writes `rentCharges` (architecture.md §8: no bill is auto-generated here).
+**Idempotency:** the notification and outbox record are created in a Firestore transaction. A retried or overlapping scheduler invocation sees the deterministic notification ID and does not create another reminder.
 
 ### `send1stTenantNotifications`
-**Trigger:** scheduled, monthly on the 1st.
-**Logic:** for every `rentCharges` with `status == 'finalized'` and `billingMonth` == the current month, transition `status → 'due'` and create a `notifications` doc for the tenant (`type: 'rent_due'`).
-**Idempotency:** same pattern — check `rentCharges.status` before transitioning; a re-run skips anything no longer `finalized`.
+**Trigger:** scheduled, monthly on the 1st at 09:00 UTC.
+**Logic:** for every `rentCharges` with `status == 'finalized'` and `billingMonth` equal to the current UTC month, atomically transition `status → 'due'` and create a `notifications` doc for the tenant (`type: 'rent_due'`) plus a delivery outbox record. Notification IDs are deterministic hashes of the rent-charge document ID.
+**Idempotency:** the transaction re-reads the bill and only transitions a still-finalized current-month bill. A retry or overlapping invocation skips bills already transitioned.
+
+### FCM delivery and token lifecycle
+
+`registerDeviceToken()` and `unregisterDeviceToken()` are authenticated,
+user-scoped callables. Tokens are stored in the user's `deviceTokens`
+subcollection under a SHA-256 token ID; clients cannot read or write that
+subcollection directly. Calls include the expected UID, which the server
+compares with the authenticated UID to reject account-switch races. Flutter
+stores the UID/token ownership pair in platform secure storage. It persists
+pending removals before attempting cleanup, unregisters only while the matching
+UID is authenticated, and retries pending cleanup on that user's next sign-in.
+Sign-out is not blocked indefinitely: the cleanup call has a short timeout and
+the durable local retry state is retained on failure. A token pending removal
+for one UID is not registered to another UID.
+
+Creation of a delivery outbox record fans out per-device tasks. A Firestore
+create trigger sends each push using Firebase Admin Messaging. A transaction
+claims each device task for five minutes. Confirmed invalid tokens are removed
+atomically with the terminal delivery state, from only the recipient's
+user-scoped token path.
+
+Transient FCM failures are persisted as `pending` with exponential delays
+starting at one minute, doubling per attempt and capped at six hours. At most
+five send attempts are made. Known permanent FCM errors and exhausted retries
+are recorded as terminal `failed` tasks with error details; confirmed invalid
+tokens use terminal `invalid`. A UTC worker runs every five minutes, retrying
+due tasks and reclaiming expired `sending` leases using the same transactional
+claim. The `devices` collection-group indexes for `(status, nextAttemptAt)` and
+`(status, leaseExpiresAt)` must be deployed with the functions.
+
+Delivery is at-least-once, not exactly-once. If FCM accepts a push but its
+acknowledgment is lost, or the worker crashes before persisting `sent`, a later
+retry can send a duplicate. The Firestore notification document remains the
+durable source of truth.
+
+Android uses the existing Firebase app configuration. iOS is not configured in
+this repository: add `ios/Runner/GoogleService-Info.plist` generated for the
+Runner target's actual bundle identifier, rerun FlutterFire configuration with
+the real iOS Firebase options, enable the Push Notifications and Background
+Modes capabilities in Xcode, and configure an APNs authentication key in
+Firebase Console before claiming iOS push support. Until then, startup displays
+a configuration-required screen instead of initializing Firebase with
+fabricated values. Web builds require the Firebase Messaging service worker and
+a Web Push VAPID key supplied as
+`--dart-define=FCM_WEB_VAPID_KEY=<public-web-push-key>`. The web key is not a
+service-account credential. Do not enable web push until the service worker,
+VAPID key, and authorized hosting origin are configured.
 
 ### `updateOverdueCharges`
 **Trigger:** scheduled, daily.

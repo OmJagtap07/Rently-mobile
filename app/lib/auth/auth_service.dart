@@ -3,6 +3,8 @@ import 'package:cloud_functions/cloud_functions.dart';
 import 'package:google_sign_in/google_sign_in.dart' as gsign;
 import 'package:flutter/foundation.dart';
 
+import '../notifications/notification_service.dart';
+
 class AuthService {
   final FirebaseAuth _auth = FirebaseAuth.instance;
   final FirebaseFunctions _functions = FirebaseFunctions.instance;
@@ -62,7 +64,16 @@ class AuthService {
   }
 
   Future<void> signOut() async {
-    await _googleSignIn.signOut();
-    await _auth.signOut();
+    try {
+      await NotificationService.instance.unregisterCurrentToken();
+    } catch (error) {
+      debugPrint('Device-token cleanup will be retried after sign-in: $error');
+    } finally {
+      try {
+        await _googleSignIn.signOut();
+      } finally {
+        await _auth.signOut();
+      }
+    }
   }
 }
