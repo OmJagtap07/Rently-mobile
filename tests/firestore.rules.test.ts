@@ -22,6 +22,12 @@ import {
 
 let testEnv: RulesTestEnvironment;
 
+const validPropertyUpiConfig = {
+  upiId: 'owner@bank',
+  upiQrImageUrl: 'https://images.example.com/qr.png',
+  upiDisplayName: 'Property Owner'
+};
+
 beforeAll(async () => {
   setLogLevel('error');
   testEnv = await initializeTestEnvironment({
@@ -47,7 +53,14 @@ beforeEach(async () => {
     await setDoc(doc(db, 'users', 'tenantB'), { uid: 'tenantB', role: 'tenant', fullName: 'TB', activeLeaseId: null });
 
     // 2. properties
-    await setDoc(doc(db, 'properties', 'propertyA1'), { landlordId: 'landlordA', status: 'active', name: 'Prop A1' });
+    await setDoc(doc(db, 'properties', 'propertyA1'), {
+      landlordId: 'landlordA',
+      status: 'active',
+      name: 'Prop A1',
+      upiId: validPropertyUpiConfig.upiId,
+      upiQrImageUrl: validPropertyUpiConfig.upiQrImageUrl,
+      upiDisplayName: validPropertyUpiConfig.upiDisplayName
+    });
     await setDoc(doc(db, 'properties', 'propertyB1'), { landlordId: 'landlordB', status: 'active', name: 'Prop B1' });
 
     // 3. units
@@ -169,7 +182,10 @@ describe('2. users', () => {
 describe('3. properties', () => {
   it('P-1 landlordA Create own property -> ALLOW', async () => {
     const db = getContext('landlord', 'landlordA').firestore();
-    await assertSucceeds(setDoc(doc(db, 'properties', 'newProp1'), { landlordId: 'landlordA' }));
+    await assertSucceeds(setDoc(doc(db, 'properties', 'newProp1'), {
+      landlordId: 'landlordA',
+      ...validPropertyUpiConfig
+    }));
   });
   it('P-2 landlordA Create property for landlordB -> DENY', async () => {
     const db = getContext('landlord', 'landlordA').firestore();
@@ -206,6 +222,45 @@ describe('3. properties', () => {
   it('P-10 landlordA Delete property -> DENY', async () => {
     const db = getContext('landlord', 'landlordA').firestore();
     await assertFails(deleteDoc(doc(db, 'properties', 'propertyA1')));
+  });
+  it('P-11 landlordA configures valid property UPI details -> ALLOW', async () => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    await assertSucceeds(updateDoc(doc(db, 'properties', 'propertyA1'), {
+      ...validPropertyUpiConfig,
+      updatedAt: Timestamp.now()
+    }));
+  });
+  it('P-12 tenantA reads property UPI details but cannot change them -> DENY', async () => {
+    const db = getContext('tenant', 'tenantA').firestore();
+    const property = await getDoc(doc(db, 'properties', 'propertyA1'));
+    expect(property.data()?.upiId).toBe('owner@bank');
+    await assertFails(updateDoc(doc(db, 'properties', 'propertyA1'), {
+      upiId: 'attacker@bank'
+    }));
+  });
+  it('P-13 landlordB cannot configure propertyA1 UPI details -> DENY', async () => {
+    const db = getContext('landlord', 'landlordB').firestore();
+    await assertFails(updateDoc(doc(db, 'properties', 'propertyA1'), {
+      ...validPropertyUpiConfig
+    }));
+  });
+  it.each([
+    ['invalid UPI ID', { ...validPropertyUpiConfig, upiId: 'not-a-vpa' }],
+    ['non-HTTPS QR URL', { ...validPropertyUpiConfig, upiQrImageUrl: 'http://images.example.com/qr.png' }],
+    ['malformed QR host', { ...validPropertyUpiConfig, upiQrImageUrl: 'https://-invalid.example/qr.png' }],
+    ['blank recipient name', { ...validPropertyUpiConfig, upiDisplayName: '   ' }]
+  ])('P-14 landlordA cannot create property with %s -> DENY', async (_caseName, config) => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    await assertFails(setDoc(doc(db, 'properties', `invalid-${_caseName}`), {
+      landlordId: 'landlordA',
+      ...config
+    }));
+  });
+  it('P-15 rejects invalid UPI configuration on owner update -> DENY', async () => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    await assertFails(updateDoc(doc(db, 'properties', 'propertyA1'), {
+      upiId: 'not-a-vpa'
+    }));
   });
 });
 

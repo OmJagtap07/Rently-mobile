@@ -77,6 +77,62 @@ No confirmed exploitable vulnerability was identified in the reviewed upload inf
 - Payment Firestore Rules tests passed: 11 tests; 123 non-payment tests were skipped.
 - `git diff --check` and Firestore index JSON parsing passed.
 - Live Cloudinary operations were not performed; emulator tests use a mock Cloudinary adapter.
+
+---
+
+# Phase 5 Task 5C-4 — UPI Payment Submission Security Review
+
+**Review date:** 2026-11-13
+**Scope:** `createUpiPayment`, payment/upload validation, Firestore transaction, notification/outbox writes, related tests, contracts, and the complete Task 5C-4 diff.
+
+## Assessment
+
+No confirmed tenant-ownership bypass, duplicate-payment race, duplicate-notification path, or client-side financial-value trust was identified. The transaction creates the payment, consumes the upload intent, claims the normalized UTR, updates the bill, and creates the notification and delivery record together. The initial review identified a non-positive bill total integrity defect. A follow-up change now rejects non-positive totals both during adjustment and payment submission.
+
+## Findings
+
+### Medium (fixed) — Non-positive bill totals could be submitted as payments
+
+- **Files:** `functions/src/payment_upload.ts`; `functions/src/index.ts`
+- **Confidence:** 9/10
+- The original implementation checked safe-integer rollups but did not require a positive bill total; adjustments could reduce a valid total to zero or below. The follow-up now rejects `newTotal <= 0` in `applyAdjustment` and `amountDue <= 0` in `createUpiPayment`.
+- **Resolution:** Regression tests cover zero and negative payment totals and adjustment results. Relevant tests: `functions/src/index.integration.test.ts` and `functions/src/payment_upload.integration.test.ts`.
+
+### Low — A retry after ambiguous Cloudinary upload success cannot recover
+
+- **Files and lines:** `functions/src/payment_upload.ts:1413-1436, 2078-2080`; `app/lib/dashboards/tenant/tenant_billing_screen.dart:335-366`
+- **Confidence:** 9/10
+- If Cloudinary stores the asset but its response is lost, the upload handler clears the claim and returns an error. Retrying with the same intent uses the same public ID and `overwrite: false`, so it fails against the already-created asset. The tenant must obtain a new intent, leaving the first asset for cleanup.
+- **Recommended action:** On an ambiguous failure or matching-asset conflict, fetch and validate the existing asset against the intent, then complete the intent idempotently.
+
+## Test gaps and deployment risks
+
+- The tests cover sequential normalized-UTR uniqueness and same-key submission concurrency, but not concurrent submissions using different idempotency keys and the same normalized UTR. They also omit mismatched lease/property ownership, invalid Cloudinary public ID/folder/HTTPS metadata, and upload timestamps outside the permission window. Relevant tests: `functions/src/payment_upload.integration.test.ts:369-398, 997-1079, 1132-1173`.
+- Firestore Rules default-deny upload intents, UTR claims, and cleanup records, but the Rules tests do not explicitly assert these denials: `firestore.rules:530-534`; `tests/firestore.rules.test.ts:774-819`.
+- The tenant app does not yet invoke `createUpiPayment`; it stops at “Proof uploaded — awaiting submission.” This is an end-to-end release blocker, but is outside the backend-only scope of Task 5C-4: `app/lib/services/tenant_payment_submission_service.dart:30-45`; `app/lib/dashboards/tenant/tenant_billing_screen.dart:516-524`.
+- Deployment requires `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET`, and `PAYMENT_UPLOAD_TOKEN_SECRET`. The token secret must be at least 32 characters: `functions/src/index.ts:40-43, 1102-1181`; `functions/src/payment_upload.ts:664-667`.
+
+## Controls reviewed
+
+- Tenant role and tenant/lease/bill/property/upload-intent ownership are checked server-side.
+- Both upload preparation and payment creation require `due` or `overdue` status.
+- Cloudinary proof metadata is verified before transaction commit; upload-intent consumption and normalized UTR claiming are transactional.
+- Identical payment retries return the existing payment; payload changes for the same key are rejected.
+- Payment totals are derived from the bill, and UPI ID and recipient display name are stored as snapshots.
+- Notification and delivery/outbox creation are atomic with payment creation, avoiding a second notification on an idempotent retry.
+- Payment records remain server-only; no Rules changes are required.
+
+## Validation notes
+
+- Payment submission and callable-role tests passed: 46 tests across 2 suites, using the Auth and Firestore emulators.
+- Billing notification regression tests passed: 14 tests, using the Auth and Firestore emulators.
+- Functions lint, build, and `git diff --check` passed.
+- Cloudinary behavior was exercised through test mocks; no live Cloudinary operation or deployment was performed.
+
+## Acceptance
+
+The medium financial-integrity defect is fixed and its focused tests pass. The low-severity ambiguous-upload retry behavior and the listed coverage gaps remain; the tenant UI also still needs to call `createUpiPayment` before the complete workflow is release-ready.
+
 ---
 
 # Phase 5 Task 5C-6 — Landlord UPI Payment Review UI Security Review

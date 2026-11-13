@@ -20,7 +20,14 @@ const recoveryConcurrency = 20;
 interface NotificationData {
   recipientId: string;
   role: "landlord" | "tenant";
-  type: "prepare_bill_reminder" | "rent_due";
+  type:
+    | "prepare_bill_reminder"
+    | "payment_proof_submitted"
+    | "overdue_rent"
+    | "rent_due"
+    | "payment_accepted"
+    | "payment_rejected"
+    | "late_fine_update";
   relatedEntity?: {type: string; id: string};
   title: string;
   body: string;
@@ -59,8 +66,10 @@ function stableId(prefix: string, ...parts: string[]): string {
  * @return {string} YYYY-MM billing month
  */
 function utcMonth(date: Date): string {
-  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1)
-    .padStart(2, "0")}`;
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(
+    2,
+    "0",
+  )}`;
 }
 
 /**
@@ -83,11 +92,11 @@ function parseScheduleTime(scheduleTime: string): Date {
  */
 function upcomingBillingMonth(scheduleTime: string): string {
   const scheduledAt = parseScheduleTime(scheduleTime);
-  return utcMonth(new Date(Date.UTC(
-    scheduledAt.getUTCFullYear(),
-    scheduledAt.getUTCMonth() + 1,
-    1
-  )));
+  return utcMonth(
+    new Date(
+      Date.UTC(scheduledAt.getUTCFullYear(), scheduledAt.getUTCMonth() + 1, 1),
+    ),
+  );
 }
 
 /**
@@ -112,10 +121,10 @@ function currentBillingMonth(scheduleTime: string): string {
 function createNotification(
   recipientId: string,
   role: "landlord" | "tenant",
-  type: "prepare_bill_reminder" | "rent_due",
+  type: NotificationData["type"],
   title: string,
   body: string,
-  relatedEntity?: {type: string; id: string}
+  relatedEntity?: { type: string; id: string },
 ): NotificationData {
   return {
     recipientId,
@@ -137,13 +146,106 @@ function createNotification(
  */
 function createDelivery(
   notificationId: string,
-  recipientId: string
+  recipientId: string,
 ): DeliveryData {
   return {
     notificationId,
     recipientId,
     status: "pending",
     createdAt: FieldValue.serverTimestamp(),
+  };
+}
+
+/**
+ * Builds the durable landlord notification and delivery outbox for a payment.
+ * @param {string} paymentId Submitted payment document ID
+ * @param {string} landlordId Owning landlord
+ * @return {object} Deterministic notification and delivery records
+ */
+export function createPaymentProofSubmittedNotification(
+  paymentId: string,
+  landlordId: string,
+): {
+  notificationId: string;
+  notification: NotificationData;
+  delivery: DeliveryData;
+} {
+  const notificationId = stableId("payment_proof_submitted", paymentId);
+  return {
+    notificationId,
+    notification: createNotification(
+      landlordId,
+      "landlord",
+      "payment_proof_submitted",
+      "UPI payment proof submitted",
+      "A tenant submitted rent payment proof for verification.",
+      {type: "payment", id: paymentId},
+    ),
+    delivery: createDelivery(notificationId, landlordId),
+  };
+}
+
+/**
+ * Builds the deterministic tenant notification for an accepted UPI payment.
+ * @param {string} paymentId Verified payment document ID
+ * @param {string} tenantId Tenant receiving the notification
+ * @return {object} Notification and delivery outbox records
+ */
+export function createPaymentAcceptedNotification(
+  paymentId: string,
+  tenantId: string,
+): {
+  notificationId: string;
+  notification: NotificationData;
+  delivery: DeliveryData;
+} {
+  const notificationId = stableId("payment_accepted", paymentId);
+  return {
+    notificationId,
+    notification: createNotification(
+      tenantId,
+      "tenant",
+      "payment_accepted",
+      "UPI payment verified",
+      "Your rent payment was verified and the bill is paid.",
+      {type: "payment", id: paymentId},
+    ),
+    delivery: createDelivery(notificationId, tenantId),
+  };
+}
+
+/**
+ * Builds the deterministic tenant notification for a rejected UPI payment.
+ * @param {string} paymentId Rejected payment document ID
+ * @param {string} tenantId Tenant receiving the notification
+ * @param {string} reason Canonical rejection reason
+ * @param {?string} explanation Explanation for the `other` reason
+ * @return {object} Notification and delivery outbox records
+ */
+export function createPaymentRejectedNotification(
+  paymentId: string,
+  tenantId: string,
+  reason: string,
+  explanation?: string,
+): {
+  notificationId: string;
+  notification: NotificationData;
+  delivery: DeliveryData;
+} {
+  const notificationId = stableId("payment_rejected", paymentId);
+  const explanationText = explanation ? ` Details: ${explanation}` : "";
+  return {
+    notificationId,
+    notification: createNotification(
+      tenantId,
+      "tenant",
+      "payment_rejected",
+      "UPI payment proof rejected",
+      `Your rent payment proof was rejected: ${reason}.${explanationText} ` +
+        "You may submit a new payment attempt.",
+      {type: "payment", id: paymentId},
+    ),
+    delivery: createDelivery(notificationId, tenantId),
   };
 }
 
@@ -155,7 +257,7 @@ function createDelivery(
  */
 async function forEachPage<T>(
   query: FirebaseFirestore.Query<T>,
-  visit: (docs: FirebaseFirestore.QueryDocumentSnapshot<T>[]) => Promise<void>
+  visit: (docs: FirebaseFirestore.QueryDocumentSnapshot<T>[]) => Promise<void>,
 ): Promise<void> {
   let cursor: FirebaseFirestore.QueryDocumentSnapshot<T> | undefined;
   let pageQuery = query.orderBy(FieldPath.documentId()).limit(pageSize);
@@ -164,7 +266,8 @@ async function forEachPage<T>(
     await visit(snapshot.docs);
     if (snapshot.size < pageSize) return;
     cursor = snapshot.docs[snapshot.docs.length - 1];
-    pageQuery = query.orderBy(FieldPath.documentId())
+    pageQuery = query
+      .orderBy(FieldPath.documentId())
       .limit(pageSize)
       .startAfter(cursor);
     snapshot = await pageQuery.get();
@@ -180,7 +283,7 @@ async function forEachPage<T>(
  */
 export async function run25thLandlordReminder(
   db: Firestore,
-  scheduleTime: string
+  scheduleTime: string,
 ): Promise<void> {
   const billingMonth = upcomingBillingMonth(scheduleTime);
   const landlords = new Set<string>();
@@ -194,7 +297,7 @@ export async function run25thLandlordReminder(
           landlords.add(landlordId);
         }
       }
-    }
+    },
   );
 
   for (const landlordId of landlords) {
@@ -202,9 +305,10 @@ export async function run25thLandlordReminder(
       "prepare_bill_reminder",
       landlordId,
       "prepare_bill_reminder",
-      billingMonth
+      billingMonth,
     );
-    const notificationRef = db.collection(notificationCollection)
+    const notificationRef = db
+      .collection(notificationCollection)
       .doc(notificationId);
     const deliveryRef = db.collection(deliveryCollection).doc(notificationId);
 
@@ -220,13 +324,13 @@ export async function run25thLandlordReminder(
           "landlord",
           "prepare_bill_reminder",
           "Prepare next month's bills",
-          `Please prepare rent bills for ${billingMonth}.`
-        )
+          `Please prepare rent bills for ${billingMonth}.`,
+        ),
       );
       if (!delivery.exists) {
         transaction.create(
           deliveryRef,
-          createDelivery(notificationId, landlordId)
+          createDelivery(notificationId, landlordId),
         );
       }
     });
@@ -253,10 +357,11 @@ function formatPaise(amount: number): string {
  */
 export async function run1stTenantNotifications(
   db: Firestore,
-  scheduleTime: string
+  scheduleTime: string,
 ): Promise<void> {
   const billingMonth = currentBillingMonth(scheduleTime);
-  const query = db.collection("rentCharges")
+  const query = db
+    .collection("rentCharges")
     .where("status", "==", "finalized")
     .where("billingMonth", "==", billingMonth);
 
@@ -264,7 +369,8 @@ export async function run1stTenantNotifications(
     for (const charge of charges) {
       const notificationId = stableId("rent_due", charge.id);
       const chargeRef = charge.ref;
-      const notificationRef = db.collection(notificationCollection)
+      const notificationRef = db
+        .collection(notificationCollection)
         .doc(notificationId);
       const deliveryRef = db.collection(deliveryCollection).doc(notificationId);
 
@@ -303,14 +409,14 @@ export async function run1stTenantNotifications(
               "rent_due",
               "Rent bill available",
               `Your ${billingMonth} rent bill is ${formatPaise(total)}.`,
-              {type: "rentCharge", id: charge.id}
-            )
+              {type: "rentCharge", id: charge.id},
+            ),
           );
         }
         if (!delivery.exists) {
           transaction.create(
             deliveryRef,
-            createDelivery(notificationId, bill.tenantId)
+            createDelivery(notificationId, bill.tenantId),
           );
         }
       });
@@ -332,7 +438,7 @@ async function createDeviceDelivery(
   deliveryRef: FirebaseFirestore.DocumentReference,
   notificationId: string,
   recipientId: string,
-  tokenHash: string
+  tokenHash: string,
 ): Promise<void> {
   const deviceDeliveryRef = deliveryRef.collection("devices").doc(tokenHash);
   await db.runTransaction(async (transaction) => {
@@ -360,7 +466,7 @@ async function createDeviceDelivery(
  */
 export async function expandNotificationDeliveries(
   db: Firestore,
-  notificationId: string
+  notificationId: string,
 ): Promise<void> {
   const deliveryRef = db.collection(deliveryCollection).doc(notificationId);
   const deliverySnapshot = await deliveryRef.get();
@@ -369,11 +475,12 @@ export async function expandNotificationDeliveries(
   const recipientId = deliverySnapshot.get("recipientId");
   if (typeof recipientId !== "string" || recipientId.length === 0) {
     throw new Error(
-      `Notification delivery ${notificationId} has no recipient.`
+      `Notification delivery ${notificationId} has no recipient.`,
     );
   }
 
-  const tokenSnapshot = await db.collection("users")
+  const tokenSnapshot = await db
+    .collection("users")
     .doc(recipientId)
     .collection("deviceTokens")
     .get();
@@ -387,13 +494,17 @@ export async function expandNotificationDeliveries(
 
   for (let offset = 0; offset < tokenSnapshot.docs.length; offset += 20) {
     const group = tokenSnapshot.docs.slice(offset, offset + 20);
-    await Promise.all(group.map((tokenDoc) => createDeviceDelivery(
-      db,
-      deliveryRef,
-      notificationId,
-      recipientId,
-      tokenDoc.id
-    )));
+    await Promise.all(
+      group.map((tokenDoc) =>
+        createDeviceDelivery(
+          db,
+          deliveryRef,
+          notificationId,
+          recipientId,
+          tokenDoc.id,
+        ),
+      ),
+    );
   }
 
   await deliveryRef.update({
@@ -422,10 +533,12 @@ function errorCode(error: unknown): string | null {
  */
 function isPermanentFcmError(error: unknown): boolean {
   const code = errorCode(error);
-  return code === "messaging/invalid-argument" ||
+  return (
+    code === "messaging/invalid-argument" ||
     code === "messaging/invalid-recipient" ||
     code === "messaging/sender-id-mismatch" ||
-    code === "messaging/third-party-auth-error";
+    code === "messaging/third-party-auth-error"
+  );
 }
 
 /**
@@ -436,11 +549,12 @@ function isPermanentFcmError(error: unknown): boolean {
  */
 function deliveryLeaseIsActive(
   data: FirebaseFirestore.DocumentData,
-  nowMs: number
+  nowMs: number,
 ): boolean {
   const leaseExpiresAt = data.leaseExpiresAt;
-  return leaseExpiresAt instanceof Timestamp &&
-    leaseExpiresAt.toMillis() > nowMs;
+  return (
+    leaseExpiresAt instanceof Timestamp && leaseExpiresAt.toMillis() > nowMs
+  );
 }
 
 /**
@@ -471,18 +585,20 @@ async function finishDelivery(
   removeToken: boolean,
   status: "invalid" | "failed",
   error?: unknown,
-  failureCode?: string
+  failureCode?: string,
 ): Promise<void> {
   const errorMessage = error instanceof Error ? error.message : String(error);
   const update = {
     status,
     leaseExpiresAt: FieldValue.delete(),
     nextAttemptAt: FieldValue.delete(),
-    ...(status === "failed" ? {
-      failedAt: FieldValue.serverTimestamp(),
-      lastError: errorMessage,
-      lastErrorCode: failureCode ?? errorCode(error),
-    } : {}),
+    ...(status === "failed" ?
+      {
+        failedAt: FieldValue.serverTimestamp(),
+        lastError: errorMessage,
+        lastErrorCode: failureCode ?? errorCode(error),
+      } :
+      {}),
     updatedAt: FieldValue.serverTimestamp(),
   };
   const batch = db.batch();
@@ -504,9 +620,10 @@ export async function deliverNotificationToDevice(
   db: Firestore,
   address: DeliveryAddress,
   send: PushSender,
-  nowMs = Date.now()
+  nowMs = Date.now(),
 ): Promise<void> {
-  const deliveryRef = db.collection(deliveryCollection)
+  const deliveryRef = db
+    .collection(deliveryCollection)
     .doc(address.notificationId)
     .collection("devices")
     .doc(address.tokenHash);
@@ -525,13 +642,16 @@ export async function deliverNotificationToDevice(
       data.status === "pending" &&
       data.nextAttemptAt instanceof Timestamp &&
       data.nextAttemptAt.toMillis() > nowMs
-    ) return null;
+    ) {
+      return null;
+    }
     if (data.status === "sending" && deliveryLeaseIsActive(data, nowMs)) {
       return null;
     }
 
     const attempts = Number.isSafeInteger(data.attempts) ?
-      data.attempts as number : 0;
+      (data.attempts as number) :
+      0;
     if (attempts >= deliveryMaxAttempts) {
       transaction.update(deliveryRef, {
         status: "failed",
@@ -561,7 +681,8 @@ export async function deliverNotificationToDevice(
   });
   if (!claim) return;
 
-  const tokenRef = db.collection("users")
+  const tokenRef = db
+    .collection("users")
     .doc(claim.recipientId)
     .collection("deviceTokens")
     .doc(claim.tokenHash);
@@ -580,7 +701,7 @@ export async function deliverNotificationToDevice(
       tokenRef,
       false,
       "failed",
-      new Error("Durable notification document is missing.")
+      new Error("Durable notification document is missing."),
     );
     return;
   }
@@ -603,10 +724,10 @@ export async function deliverNotificationToDevice(
     data: {
       notificationId: claim.notificationId,
       type: notification.type as string,
-      relatedEntityType: typeof relatedEntity?.type === "string" ?
-        relatedEntity.type : "",
-      relatedEntityId: typeof relatedEntity?.id === "string" ?
-        relatedEntity.id : "",
+      relatedEntityType:
+        typeof relatedEntity?.type === "string" ? relatedEntity.type : "",
+      relatedEntityId:
+        typeof relatedEntity?.id === "string" ? relatedEntity.id : "",
     },
   };
 
@@ -630,7 +751,7 @@ export async function deliverNotificationToDevice(
         false,
         "failed",
         error,
-        claim.attempts >= deliveryMaxAttempts ? "retry-exhausted" : undefined
+        claim.attempts >= deliveryMaxAttempts ? "retry-exhausted" : undefined,
       );
       return;
     }
@@ -639,7 +760,7 @@ export async function deliverNotificationToDevice(
       status: "pending",
       leaseExpiresAt: FieldValue.delete(),
       nextAttemptAt: Timestamp.fromMillis(
-        nowMs + deliveryRetryDelayMs(claim.attempts)
+        nowMs + deliveryRetryDelayMs(claim.attempts),
       ),
       lastError: error instanceof Error ? error.message : String(error),
       lastErrorCode: code,
@@ -668,28 +789,32 @@ export async function deliverNotificationToDevice(
 export async function recoverNotificationDeliveries(
   db: Firestore,
   send: PushSender,
-  nowMs = Date.now()
+  nowMs = Date.now(),
 ): Promise<void> {
   const now = Timestamp.fromMillis(nowMs);
-  const pendingQuery = db.collectionGroup("devices")
+  const pendingQuery = db
+    .collectionGroup("devices")
     .where("status", "==", "pending");
   await forEachPage(pendingQuery, async (tasks) => {
     for (let offset = 0; offset < tasks.length; offset += recoveryConcurrency) {
       const group = tasks.slice(offset, offset + recoveryConcurrency);
-      await Promise.all(group.map((task) => {
-        const deliveryRef = task.ref.parent.parent;
-        if (deliveryRef === null) return Promise.resolve();
-        return deliverNotificationToDevice(
-          db,
-          {notificationId: deliveryRef.id, tokenHash: task.id},
-          send,
-          nowMs
-        );
-      }));
+      await Promise.all(
+        group.map((task) => {
+          const deliveryRef = task.ref.parent.parent;
+          if (deliveryRef === null) return Promise.resolve();
+          return deliverNotificationToDevice(
+            db,
+            {notificationId: deliveryRef.id, tokenHash: task.id},
+            send,
+            nowMs,
+          );
+        }),
+      );
     }
   });
 
-  const staleQuery = db.collectionGroup("devices")
+  const staleQuery = db
+    .collectionGroup("devices")
     .where("status", "==", "sending")
     .where("leaseExpiresAt", "<=", now)
     .limit(recoveryPageSize);
@@ -700,16 +825,18 @@ export async function recoverNotificationDeliveries(
     offset += recoveryConcurrency
   ) {
     const group = stale.docs.slice(offset, offset + recoveryConcurrency);
-    await Promise.all(group.map((task) => {
-      const deliveryRef = task.ref.parent.parent;
-      if (deliveryRef === null) return Promise.resolve();
-      return deliverNotificationToDevice(
-        db,
-        {notificationId: deliveryRef.id, tokenHash: task.id},
-        send,
-        nowMs
-      );
-    }));
+    await Promise.all(
+      group.map((task) => {
+        const deliveryRef = task.ref.parent.parent;
+        if (deliveryRef === null) return Promise.resolve();
+        return deliverNotificationToDevice(
+          db,
+          {notificationId: deliveryRef.id, tokenHash: task.id},
+          send,
+          nowMs,
+        );
+      }),
+    );
   }
 }
 

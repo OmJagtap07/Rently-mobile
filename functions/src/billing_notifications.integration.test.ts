@@ -1,4 +1,5 @@
-const projectId = "demo-rently";
+// Keep direct worker tests isolated from Functions emulator Firestore triggers.
+const projectId = "demo-rently-billing-notifications";
 const firestoreEmulatorPort =
   process.env.PHASE3_FIRESTORE_EMULATOR_PORT ?? "8080";
 

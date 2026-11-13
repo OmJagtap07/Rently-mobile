@@ -5,6 +5,7 @@ import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 
 import 'monthly_billing_repository.dart';
+import 'property_payment_details.dart';
 
 class PropertyService implements MonthlyBillingRepository {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
@@ -26,10 +27,18 @@ class PropertyService implements MonthlyBillingRepository {
   Future<String> createProperty({
     required String name,
     required String address,
+    required String upiId,
+    required String upiQrImageUrl,
+    required String upiDisplayName,
     String? googleMapsLink,
   }) async {
     final uid = currentUid;
     if (uid == null) throw Exception('User not authenticated');
+    validatePropertyUpiDetails(
+      upiId: upiId,
+      upiQrImageUrl: upiQrImageUrl,
+      upiDisplayName: upiDisplayName,
+    );
 
     final joinCode = _generateJoinCode();
     final docRef = _firestore.collection('properties').doc();
@@ -42,6 +51,9 @@ class PropertyService implements MonthlyBillingRepository {
       'googleMapsLink': googleMapsLink?.trim().isEmpty ?? true
           ? null
           : googleMapsLink!.trim(),
+      'upiId': upiId.trim(),
+      'upiQrImageUrl': normalizeUpiQrImageUrl(upiQrImageUrl),
+      'upiDisplayName': upiDisplayName.trim(),
       'joinCode': joinCode,
       'status': 'active',
       'createdAt': now,
@@ -49,6 +61,28 @@ class PropertyService implements MonthlyBillingRepository {
     });
 
     return docRef.id;
+  }
+
+  Future<void> updatePropertyUpiDetails({
+    required String propertyId,
+    required String upiId,
+    required String upiQrImageUrl,
+    required String upiDisplayName,
+  }) async {
+    final uid = currentUid;
+    if (uid == null) throw Exception('User not authenticated');
+    validatePropertyUpiDetails(
+      upiId: upiId,
+      upiQrImageUrl: upiQrImageUrl,
+      upiDisplayName: upiDisplayName,
+    );
+
+    await _firestore.collection('properties').doc(propertyId).update({
+      'upiId': upiId.trim(),
+      'upiQrImageUrl': normalizeUpiQrImageUrl(upiQrImageUrl),
+      'upiDisplayName': upiDisplayName.trim(),
+      'updatedAt': FieldValue.serverTimestamp(),
+    });
   }
 
   /// Stream of all active/managed properties for the current landlord.

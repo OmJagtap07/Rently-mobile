@@ -1163,6 +1163,44 @@ describe("monthly rent-charge emulator integration", () => {
     }
   );
 
+  it(
+    "rejects adjustments that would leave a non-positive bill total",
+    async () => {
+      const leaseId = await createBillingLease();
+      const rentChargeId = await addRentChargeDraft(leaseId);
+      await callFunction(
+        "finalizeRentCharge",
+        fixture.landlord,
+        {rentChargeId}
+      );
+      const billRef = firestore().collection("rentCharges").doc(rentChargeId);
+      const before = await billRef.get();
+      const total = before.data()!.total as number;
+
+      for (const amount of [-total, -total - 1]) {
+        const idempotencyKey = randomUUID();
+        const response = await callFunction(
+          "applyAdjustment",
+          fixture.landlord,
+          {
+            rentChargeId,
+            amount,
+            reason: "Invalid non-positive total",
+            idempotencyKey,
+          }
+        );
+
+        expect(response.error?.status).toBe("FAILED_PRECONDITION");
+        const [after, adjustment] = await Promise.all([
+          billRef.get(),
+          billRef.collection("adjustments").doc(idempotencyKey).get(),
+        ]);
+        expect(after.data()).toEqual(before.data());
+        expect(adjustment.exists).toBe(false);
+      }
+    }
+  );
+
   it("makes concurrent adjustment retries idempotent", async () => {
     const leaseId = await createBillingLease();
     const rentChargeId = await addRentChargeDraft(leaseId);

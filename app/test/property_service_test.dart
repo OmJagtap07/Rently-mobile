@@ -31,101 +31,139 @@ void main() {
   setUp(() {
     firestore.documents.clear();
     firestore.operations.clear();
+    firestore.documentWrites.clear();
+  });
+
+  group('PropertyService property UPI configuration', () {
+    test('accepts and stores uppercase HTTPS with other URL parts preserved', () async {
+      final service = _service();
+      const inputUrl =
+          'HTTPS://Images.Example.com:8443/qr.png?size=large&format=png#preview';
+
+      final propertyId = await service.createProperty(
+        name: 'Example Property',
+        address: '1 Example Road',
+        upiId: 'owner@bank',
+        upiQrImageUrl: inputUrl,
+        upiDisplayName: 'Property Owner',
+      );
+
+      expect(propertyId, 'generated-id');
+      expect(firestore.operations, ['set:properties/generated-id']);
+      expect(
+        firestore.documentWrites['properties/generated-id']?['upiQrImageUrl'],
+        'https://Images.Example.com:8443/qr.png?size=large&format=png#preview',
+      );
+    });
   });
 
   group('PropertyService.saveDraft transaction', () {
-    test('rejects a stale updatedAt without overwriting newer bill data', () async {
-      final newerBill = _draft(updatedAt: Timestamp(11, 0), amount: 1500);
-      firestore.documents['rentCharges/lease-1_2026-11'] = newerBill;
-      firestore.documents['leases/lease-1'] = _activeLease();
+    test(
+      'rejects a stale updatedAt without overwriting newer bill data',
+      () async {
+        final newerBill = _draft(updatedAt: Timestamp(11, 0), amount: 1500);
+        firestore.documents['rentCharges/lease-1_2026-11'] = newerBill;
+        firestore.documents['leases/lease-1'] = _activeLease();
 
-      await expectLater(
-        _service().saveDraft(
+        await expectLater(
+          _service().saveDraft(
+            lease: _lease,
+            billingMonth: '2026-11',
+            lineItems: _editedItems,
+            expectedUpdatedAt: Timestamp(10, 0),
+          ),
+          throwsA(
+            isA<StateError>().having(
+              (error) => error.message,
+              'message',
+              contains('changed since it was opened'),
+            ),
+          ),
+        );
+
+        expect(firestore.operations, [
+          'read:rentCharges/lease-1_2026-11',
+          'read:leases/lease-1',
+        ]);
+        expect(
+          firestore.documents['rentCharges/lease-1_2026-11']!['lineItems'],
+          newerBill['lineItems'],
+        );
+        expect(
+          firestore.documents['rentCharges/lease-1_2026-11']!['updatedAt'],
+          Timestamp(11, 0),
+        );
+      },
+    );
+
+    test(
+      'allows an edit when updatedAt matches and reads before writing',
+      () async {
+        firestore.documents['rentCharges/lease-1_2026-11'] = _draft(
+          updatedAt: Timestamp(10, 0),
+          amount: 1000,
+        );
+        firestore.documents['leases/lease-1'] = _activeLease();
+
+        final id = await _service().saveDraft(
           lease: _lease,
           billingMonth: '2026-11',
           lineItems: _editedItems,
           expectedUpdatedAt: Timestamp(10, 0),
-        ),
-        throwsA(
-          isA<StateError>().having(
-            (error) => error.message,
-            'message',
-            contains('changed since it was opened'),
+        );
+
+        expect(id, 'lease-1_2026-11');
+        expect(firestore.operations, [
+          'read:rentCharges/lease-1_2026-11',
+          'read:leases/lease-1',
+          'write:rentCharges/lease-1_2026-11',
+        ]);
+        expect(firestore.transaction!.writes, hasLength(1));
+        expect(
+          firestore.transaction!.writes.single.keys.map(
+            (field) => field.components.join('.'),
           ),
-        ),
-      );
+          containsAll(['lineItems', 'subtotal', 'total', 'updatedAt']),
+        );
+      },
+    );
 
-      expect(firestore.operations, [
-        'read:rentCharges/lease-1_2026-11',
-        'read:leases/lease-1',
-      ]);
-      expect(
-        firestore.documents['rentCharges/lease-1_2026-11']!['lineItems'],
-        newerBill['lineItems'],
-      );
-      expect(
-        firestore.documents['rentCharges/lease-1_2026-11']!['updatedAt'],
-        Timestamp(11, 0),
-      );
-    });
+    test(
+      'rejects saving when the lease is inactive before the transaction',
+      () async {
+        firestore.documents['rentCharges/lease-1_2026-11'] = _draft(
+          updatedAt: Timestamp(10, 0),
+          amount: 1000,
+        );
+        firestore.documents['leases/lease-1'] = _activeLease(status: 'ended');
 
-    test('allows an edit when updatedAt matches and reads before writing', () async {
-      firestore.documents['rentCharges/lease-1_2026-11'] =
-          _draft(updatedAt: Timestamp(10, 0), amount: 1000);
-      firestore.documents['leases/lease-1'] = _activeLease();
-
-      final id = await _service().saveDraft(
-        lease: _lease,
-        billingMonth: '2026-11',
-        lineItems: _editedItems,
-        expectedUpdatedAt: Timestamp(10, 0),
-      );
-
-      expect(id, 'lease-1_2026-11');
-      expect(firestore.operations, [
-        'read:rentCharges/lease-1_2026-11',
-        'read:leases/lease-1',
-        'write:rentCharges/lease-1_2026-11',
-      ]);
-      expect(firestore.transaction!.writes, hasLength(1));
-      expect(
-        firestore.transaction!.writes.single.keys
-            .map((field) => field.components.join('.')),
-        containsAll(['lineItems', 'subtotal', 'total', 'updatedAt']),
-      );
-    });
-
-    test('rejects saving when the lease is inactive before the transaction', () async {
-      firestore.documents['rentCharges/lease-1_2026-11'] =
-          _draft(updatedAt: Timestamp(10, 0), amount: 1000);
-      firestore.documents['leases/lease-1'] = _activeLease(status: 'ended');
-
-      await expectLater(
-        _service().saveDraft(
-          lease: _lease,
-          billingMonth: '2026-11',
-          lineItems: _editedItems,
-          expectedUpdatedAt: Timestamp(10, 0),
-        ),
-        throwsA(
-          isA<StateError>().having(
-            (error) => error.message,
-            'message',
-            contains('lease is no longer active'),
+        await expectLater(
+          _service().saveDraft(
+            lease: _lease,
+            billingMonth: '2026-11',
+            lineItems: _editedItems,
+            expectedUpdatedAt: Timestamp(10, 0),
           ),
-        ),
-      );
+          throwsA(
+            isA<StateError>().having(
+              (error) => error.message,
+              'message',
+              contains('lease is no longer active'),
+            ),
+          ),
+        );
 
-      expect(firestore.operations, [
-        'read:rentCharges/lease-1_2026-11',
-        'read:leases/lease-1',
-      ]);
-      expect(firestore.transaction!.writes, isEmpty);
-      expect(
-        firestore.documents['rentCharges/lease-1_2026-11']!['lineItems'],
-        _draft(updatedAt: Timestamp(10, 0), amount: 1000)['lineItems'],
-      );
-    });
+        expect(firestore.operations, [
+          'read:rentCharges/lease-1_2026-11',
+          'read:leases/lease-1',
+        ]);
+        expect(firestore.transaction!.writes, isEmpty);
+        expect(
+          firestore.documents['rentCharges/lease-1_2026-11']!['lineItems'],
+          _draft(updatedAt: Timestamp(10, 0), amount: 1000)['lineItems'],
+        );
+      },
+    );
   });
 }
 
@@ -215,11 +253,10 @@ class _TestFirebasePlatform extends core_platform.FirebasePlatform {
 
 class _RecordingFirestorePlatform
     extends firestore_platform.FirebaseFirestorePlatform {
-  _RecordingFirestorePlatform({
-    required super.appInstance,
-  });
+  _RecordingFirestorePlatform({required super.appInstance});
 
   final Map<String, Map<String, dynamic>> documents = {};
+  final Map<String, Map<String, dynamic>> documentWrites = {};
   final List<String> operations = [];
   _RecordingTransactionPlatform? transaction;
 
@@ -256,10 +293,7 @@ class _RecordingFirestorePlatform
 
 class _TestCollectionReference
     extends firestore_platform.CollectionReferencePlatform {
-  _TestCollectionReference(
-    super.firestore,
-    super.path,
-  );
+  _TestCollectionReference(super.firestore, super.path);
 
   @override
   firestore_platform.DocumentReferencePlatform doc([String? path]) =>
@@ -272,6 +306,15 @@ class _TestCollectionReference
 class _TestDocumentReference
     extends firestore_platform.DocumentReferencePlatform {
   _TestDocumentReference(super.firestore, super.path);
+
+  @override
+  Future<void> set(
+    Map<String, dynamic> data, [
+    firestore_platform.SetOptions? options,
+  ]) async {
+    firestore.operations.add('set:$path');
+    firestore.documentWrites[path] = data;
+  }
 }
 
 class _RecordingTransactionPlatform

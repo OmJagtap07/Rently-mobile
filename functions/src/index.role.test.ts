@@ -3,8 +3,11 @@ import {
   applyAdjustment,
   acceptJoinRequest,
   createJoinRequest,
+  createUpiPayment,
   finalizeRentCharge,
+  preparePaymentProofUpload,
   resolveJoinCode,
+  verifyUpiPayment,
 } from "./index";
 import type {CallableRequest} from "firebase-functions/v2/https";
 
@@ -13,8 +16,11 @@ const wrapped = {
   acceptJoinRequest: testEnv.wrap(acceptJoinRequest),
   applyAdjustment: testEnv.wrap(applyAdjustment),
   createJoinRequest: testEnv.wrap(createJoinRequest),
+  createUpiPayment: testEnv.wrap(createUpiPayment),
   finalizeRentCharge: testEnv.wrap(finalizeRentCharge),
+  preparePaymentProofUpload: testEnv.wrap(preparePaymentProofUpload),
   resolveJoinCode: testEnv.wrap(resolveJoinCode),
+  verifyUpiPayment: testEnv.wrap(verifyUpiPayment),
 };
 
 type UserRole = "landlord" | "tenant";
@@ -55,77 +61,125 @@ describe("callable role authorization", () => {
   });
 
   it("allows tenants to resolve join codes", async () => {
-    await expect(
-      wrapped.resolveJoinCode(request("tenant"))
-    ).rejects.toThrow("A valid join code is required.");
+    await expect(wrapped.resolveJoinCode(request("tenant"))).rejects.toThrow(
+      "A valid join code is required.",
+    );
   });
 
   it("denies landlords from resolving join codes", async () => {
-    await expect(
-      wrapped.resolveJoinCode(request("landlord"))
-    ).rejects.toThrow("Only tenants can perform this action.");
+    await expect(wrapped.resolveJoinCode(request("landlord"))).rejects.toThrow(
+      "Only tenants can perform this action.",
+    );
   });
 
   it("allows tenants to create join requests", async () => {
-    await expect(
-      wrapped.createJoinRequest(request("tenant"))
-    ).rejects.toThrow("propertyId is required.");
+    await expect(wrapped.createJoinRequest(request("tenant"))).rejects.toThrow(
+      "propertyId is required.",
+    );
   });
 
   it("denies landlords from creating join requests", async () => {
     await expect(
-      wrapped.createJoinRequest(request("landlord"))
+      wrapped.createJoinRequest(request("landlord")),
     ).rejects.toThrow("Only tenants can perform this action.");
   });
 
   it("allows landlords to accept join requests", async () => {
     await expect(
-      wrapped.acceptJoinRequest(request("landlord"))
+      wrapped.acceptJoinRequest(request("landlord")),
     ).rejects.toThrow("joinRequestId is required.");
   });
 
   it("denies tenants from accepting join requests", async () => {
-    await expect(
-      wrapped.acceptJoinRequest(request("tenant"))
-    ).rejects.toThrow("Only landlords can perform this action.");
+    await expect(wrapped.acceptJoinRequest(request("tenant"))).rejects.toThrow(
+      "Only landlords can perform this action.",
+    );
   });
 
   it(
     "allows landlords to reach rent-charge finalization validation",
     async () => {
       await expect(
-        wrapped.finalizeRentCharge(request("landlord"))
+        wrapped.finalizeRentCharge(request("landlord")),
       ).rejects.toThrow("rentChargeId is required.");
-    }
+    },
   );
 
   it("denies tenants from finalizing rent charges", async () => {
-    await expect(
-      wrapped.finalizeRentCharge(request("tenant"))
-    ).rejects.toThrow("Only landlords can perform this action.");
+    await expect(wrapped.finalizeRentCharge(request("tenant"))).rejects.toThrow(
+      "Only landlords can perform this action.",
+    );
   });
 
   it("rejects unauthenticated rent-charge finalization", async () => {
     await expect(
-      wrapped.finalizeRentCharge({...request("landlord"), auth: undefined})
+      wrapped.finalizeRentCharge({...request("landlord"), auth: undefined}),
     ).rejects.toThrow("User must be authenticated.");
   });
 
   it("allows landlords to reach adjustment validation", async () => {
-    await expect(
-      wrapped.applyAdjustment(request("landlord"))
-    ).rejects.toThrow("rentChargeId is required.");
+    await expect(wrapped.applyAdjustment(request("landlord"))).rejects.toThrow(
+      "rentChargeId is required.",
+    );
   });
 
   it("denies tenants from applying rent-charge adjustments", async () => {
-    await expect(
-      wrapped.applyAdjustment(request("tenant"))
-    ).rejects.toThrow("Only landlords can perform this action.");
+    await expect(wrapped.applyAdjustment(request("tenant"))).rejects.toThrow(
+      "Only landlords can perform this action.",
+    );
   });
 
   it("rejects unauthenticated rent-charge adjustments", async () => {
     await expect(
-      wrapped.applyAdjustment({...request("landlord"), auth: undefined})
+      wrapped.applyAdjustment({...request("landlord"), auth: undefined}),
     ).rejects.toThrow("User must be authenticated.");
+  });
+
+  it("rejects unauthenticated payment upload preparation", async () => {
+    await expect(
+      wrapped.preparePaymentProofUpload({
+        ...request("tenant"),
+        auth: undefined,
+      }),
+    ).rejects.toThrow("User must be authenticated.");
+  });
+
+  it("denies landlords from preparing tenant payment uploads", async () => {
+    await expect(
+      wrapped.preparePaymentProofUpload(request("landlord")),
+    ).rejects.toThrow("Only tenants can perform this action.");
+  });
+
+  it("rejects unauthenticated UPI payment submission", async () => {
+    await expect(
+      wrapped.createUpiPayment({...request("tenant"), auth: undefined}),
+    ).rejects.toThrow("User must be authenticated.");
+  });
+
+  it("denies landlords from creating tenant UPI payments", async () => {
+    await expect(wrapped.createUpiPayment(request("landlord"))).rejects.toThrow(
+      "Only tenants can perform this action.",
+    );
+  });
+
+  it("rejects unauthenticated UPI payment verification", async () => {
+    await expect(
+      wrapped.verifyUpiPayment({
+        ...request("landlord"),
+        auth: undefined,
+      }),
+    ).rejects.toThrow("User must be authenticated.");
+  });
+
+  it("denies tenants from verifying UPI payments", async () => {
+    await expect(wrapped.verifyUpiPayment(request("tenant"))).rejects.toThrow(
+      "Only landlords can perform this action.",
+    );
+  });
+
+  it("allows landlords to reach payment decision validation", async () => {
+    await expect(wrapped.verifyUpiPayment(request("landlord"))).rejects.toThrow(
+      "A valid paymentId is required.",
+    );
   });
 });

@@ -1,7 +1,13 @@
-import {setGlobalOptions} from "firebase-functions";
-import {onCall, HttpsError} from "firebase-functions/v2/https";
+import {logger, setGlobalOptions} from "firebase-functions";
+import {
+  onCall,
+  onRequest,
+  HttpsError,
+  type CallableRequest,
+} from "firebase-functions/v2/https";
 import {onSchedule} from "firebase-functions/v2/scheduler";
 import {onDocumentCreated} from "firebase-functions/v2/firestore";
+import {defineSecret} from "firebase-functions/params";
 import {initializeApp, getApps} from "firebase-admin/app";
 import {getFirestore, FieldValue} from "firebase-admin/firestore";
 import {getAuth} from "firebase-admin/auth";
@@ -14,6 +20,14 @@ import {
   run1stTenantNotifications,
   run25thLandlordReminder,
 } from "./billing_notifications";
+import {
+  createCloudinaryGateway,
+  createPaymentUploadHttpHandler,
+  createPaymentUploadService,
+  type CreateUpiPaymentInput,
+  type PreparePaymentUploadInput,
+  type VerifyUpiPaymentInput,
+} from "./payment_upload";
 
 if (!getApps().length) {
   initializeApp();
@@ -23,6 +37,39 @@ const db = getFirestore();
 const auth = getAuth();
 
 setGlobalOptions({maxInstances: 10});
+
+const cloudinaryCloudName = defineSecret("CLOUDINARY_CLOUD_NAME");
+const cloudinaryApiKey = defineSecret("CLOUDINARY_API_KEY");
+const cloudinaryApiSecret = defineSecret("CLOUDINARY_API_SECRET");
+const paymentUploadTokenSecret = defineSecret("PAYMENT_UPLOAD_TOKEN_SECRET");
+const functionsRegion = "us-central1";
+
+/**
+ * Returns the fixed upload endpoint URL for the active project or emulator.
+ * @param {CallableRequest<PreparePaymentUploadInput>} request Callable request
+ * @return {string} HTTPS production URL or local emulator URL
+ */
+function paymentProofUploadUrl(
+  request: CallableRequest<PreparePaymentUploadInput>,
+): string {
+  const projectId = getApps()[0]?.options.projectId;
+  if (typeof projectId !== "string" || projectId.length === 0) {
+    throw new Error("Firebase project ID is unavailable.");
+  }
+  if (process.env.FUNCTIONS_EMULATOR === "true") {
+    const origin = `${request.rawRequest.protocol}://${request.rawRequest.get("host")}`;
+    const requestUrl = new URL(request.rawRequest.originalUrl, origin);
+    if (!requestUrl.pathname.endsWith("/preparePaymentProofUpload")) {
+      throw new Error("Callable upload preparation URL is invalid.");
+    }
+    requestUrl.pathname = requestUrl.pathname.replace(
+      /preparePaymentProofUpload$/,
+      "uploadPaymentProof",
+    );
+    return requestUrl.toString();
+  }
+  return `https://${functionsRegion}-${projectId}.cloudfunctions.net/uploadPaymentProof`;
+}
 
 type UserRole = "landlord" | "tenant";
 
@@ -36,7 +83,7 @@ function requireRole(role: unknown, expectedRole: UserRole): void {
   if (role !== expectedRole) {
     throw new HttpsError(
       "permission-denied",
-      `Only ${expectedRole}s can perform this action.`
+      `Only ${expectedRole}s can perform this action.`,
     );
   }
 }
@@ -57,7 +104,7 @@ export const completeOnboarding = onCall<CompleteOnboardingInput>(
     if (!request.auth) {
       throw new HttpsError(
         "unauthenticated",
-        "User must be authenticated to complete onboarding."
+        "User must be authenticated to complete onboarding.",
       );
     }
 
@@ -68,21 +115,21 @@ export const completeOnboarding = onCall<CompleteOnboardingInput>(
     if (role !== "landlord" && role !== "tenant") {
       throw new HttpsError(
         "invalid-argument",
-        "Role must be either 'landlord' or 'tenant'."
+        "Role must be either 'landlord' or 'tenant'.",
       );
     }
 
     if (!fullName || typeof fullName !== "string" || !fullName.trim()) {
       throw new HttpsError(
         "invalid-argument",
-        "Full name is required and must be a non-empty string."
+        "Full name is required and must be a non-empty string.",
       );
     }
 
     if (!phone || typeof phone !== "string" || !phone.trim()) {
       throw new HttpsError(
         "invalid-argument",
-        "Phone number is required and must be a non-empty string."
+        "Phone number is required and must be a non-empty string.",
       );
     }
 
@@ -106,7 +153,7 @@ export const completeOnboarding = onCall<CompleteOnboardingInput>(
         }
         throw new HttpsError(
           "already-exists",
-          "User has already completed onboarding."
+          "User has already completed onboarding.",
         );
       }
     }
@@ -114,7 +161,7 @@ export const completeOnboarding = onCall<CompleteOnboardingInput>(
     if (existingRole && existingRole !== role) {
       throw new HttpsError(
         "already-exists",
-        "User already has an assigned role claim."
+        "User already has an assigned role claim.",
       );
     }
 
@@ -140,7 +187,7 @@ export const completeOnboarding = onCall<CompleteOnboardingInput>(
       uid,
       role,
     };
-  }
+  },
 );
 
 interface ResolveJoinCodeInput {
@@ -151,49 +198,41 @@ interface ResolveJoinCodeInput {
  * Callable function for tenants to look up basic property details by joinCode.
  * Deliberately withholds landlordId and private details.
  */
-export const resolveJoinCode = onCall<ResolveJoinCodeInput>(
-  async (request) => {
-    if (!request.auth) {
-      throw new HttpsError(
-        "unauthenticated",
-        "User must be authenticated."
-      );
-    }
-    requireRole(request.auth.token.role, "tenant");
-
-    const {joinCode} = request.data || {};
-    if (!joinCode || typeof joinCode !== "string" || !joinCode.trim()) {
-      throw new HttpsError(
-        "invalid-argument",
-        "A valid join code is required."
-      );
-    }
-
-    const trimmedCode = joinCode.trim().toUpperCase();
-    const querySnapshot = await db
-      .collection("properties")
-      .where("joinCode", "==", trimmedCode)
-      .where("status", "==", "active")
-      .limit(1)
-      .get();
-
-    if (querySnapshot.empty) {
-      throw new HttpsError(
-        "not-found",
-        "No active property found matching this join code."
-      );
-    }
-
-    const propertyDoc = querySnapshot.docs[0];
-    const data = propertyDoc.data();
-
-    return {
-      propertyId: propertyDoc.id,
-      name: data.name,
-      address: data.address,
-    };
+export const resolveJoinCode = onCall<ResolveJoinCodeInput>(async (request) => {
+  if (!request.auth) {
+    throw new HttpsError("unauthenticated", "User must be authenticated.");
   }
-);
+  requireRole(request.auth.token.role, "tenant");
+
+  const {joinCode} = request.data || {};
+  if (!joinCode || typeof joinCode !== "string" || !joinCode.trim()) {
+    throw new HttpsError("invalid-argument", "A valid join code is required.");
+  }
+
+  const trimmedCode = joinCode.trim().toUpperCase();
+  const querySnapshot = await db
+    .collection("properties")
+    .where("joinCode", "==", trimmedCode)
+    .where("status", "==", "active")
+    .limit(1)
+    .get();
+
+  if (querySnapshot.empty) {
+    throw new HttpsError(
+      "not-found",
+      "No active property found matching this join code.",
+    );
+  }
+
+  const propertyDoc = querySnapshot.docs[0];
+  const data = propertyDoc.data();
+
+  return {
+    propertyId: propertyDoc.id,
+    name: data.name,
+    address: data.address,
+  };
+});
 
 interface CreateJoinRequestInput {
   propertyId: string;
@@ -207,20 +246,14 @@ interface CreateJoinRequestInput {
 export const createJoinRequest = onCall<CreateJoinRequestInput>(
   async (request) => {
     if (!request.auth) {
-      throw new HttpsError(
-        "unauthenticated",
-        "User must be authenticated."
-      );
+      throw new HttpsError("unauthenticated", "User must be authenticated.");
     }
     requireRole(request.auth.token.role, "tenant");
     const uid = request.auth.uid;
 
     const {propertyId, message} = request.data || {};
     if (!propertyId || typeof propertyId !== "string" || !propertyId.trim()) {
-      throw new HttpsError(
-        "invalid-argument",
-        "propertyId is required."
-      );
+      throw new HttpsError("invalid-argument", "propertyId is required.");
     }
 
     const propertyRef = db.collection("properties").doc(propertyId.trim());
@@ -228,7 +261,7 @@ export const createJoinRequest = onCall<CreateJoinRequestInput>(
     if (!propertyDoc.exists || propertyDoc.data()?.status !== "active") {
       throw new HttpsError(
         "failed-precondition",
-        "Property not found or is not currently active."
+        "Property not found or is not currently active.",
       );
     }
 
@@ -237,14 +270,14 @@ export const createJoinRequest = onCall<CreateJoinRequestInput>(
     if (!userDoc.exists) {
       throw new HttpsError(
         "failed-precondition",
-        "Tenant profile must be onboarded first."
+        "Tenant profile must be onboarded first.",
       );
     }
 
     if (userDoc.data()?.activeLeaseId) {
       throw new HttpsError(
         "failed-precondition",
-        "Tenant already has an active tenancy and cannot apply."
+        "Tenant already has an active tenancy and cannot apply.",
       );
     }
 
@@ -268,7 +301,7 @@ export const createJoinRequest = onCall<CreateJoinRequestInput>(
     if (!landlordId) {
       throw new HttpsError(
         "failed-precondition",
-        "Target property has no assigned landlord."
+        "Target property has no assigned landlord.",
       );
     }
 
@@ -296,7 +329,7 @@ export const createJoinRequest = onCall<CreateJoinRequestInput>(
       success: true,
       joinRequestId: newRequestRef.id,
     };
-  }
+  },
 );
 
 interface AcceptJoinRequestInput {
@@ -312,26 +345,17 @@ interface AcceptJoinRequestInput {
 export const acceptJoinRequest = onCall<AcceptJoinRequestInput>(
   async (request) => {
     if (!request.auth) {
-      throw new HttpsError(
-        "unauthenticated",
-        "User must be authenticated."
-      );
+      throw new HttpsError("unauthenticated", "User must be authenticated.");
     }
     requireRole(request.auth.token.role, "landlord");
     const uid = request.auth.uid;
 
     const {joinRequestId, unitId, joiningDate} = request.data || {};
     if (!joinRequestId || typeof joinRequestId !== "string") {
-      throw new HttpsError(
-        "invalid-argument",
-        "joinRequestId is required."
-      );
+      throw new HttpsError("invalid-argument", "joinRequestId is required.");
     }
     if (!unitId || typeof unitId !== "string") {
-      throw new HttpsError(
-        "invalid-argument",
-        "unitId is required."
-      );
+      throw new HttpsError("invalid-argument", "unitId is required.");
     }
 
     let resolvedJoiningDate = new Date().toISOString().split("T")[0];
@@ -357,13 +381,13 @@ export const acceptJoinRequest = onCall<AcceptJoinRequestInput>(
       if (requestData?.landlordId !== uid) {
         throw new HttpsError(
           "permission-denied",
-          "You do not own the property for this request."
+          "You do not own the property for this request.",
         );
       }
       if (requestData?.status !== "pending") {
         throw new HttpsError(
           "failed-precondition",
-          "Join request is no longer pending."
+          "Join request is no longer pending.",
         );
       }
 
@@ -376,20 +400,14 @@ export const acceptJoinRequest = onCall<AcceptJoinRequestInput>(
         throw new HttpsError("not-found", "Unit not found.");
       }
       const unitData = unitDoc.data();
-      if (
-        unitData?.propertyId !== propertyId ||
-        unitData?.landlordId !== uid
-      ) {
+      if (unitData?.propertyId !== propertyId || unitData?.landlordId !== uid) {
         throw new HttpsError(
           "failed-precondition",
-          "Unit does not belong to this property."
+          "Unit does not belong to this property.",
         );
       }
       if (unitData?.status !== "vacant") {
-        throw new HttpsError(
-          "failed-precondition",
-          "Unit is not vacant."
-        );
+        throw new HttpsError("failed-precondition", "Unit is not vacant.");
       }
 
       // Check tenant's activeLeaseId inside transaction
@@ -401,7 +419,7 @@ export const acceptJoinRequest = onCall<AcceptJoinRequestInput>(
       if (tenantDoc.data()?.activeLeaseId) {
         throw new HttpsError(
           "failed-precondition",
-          "Tenant already has an active lease."
+          "Tenant already has an active lease.",
         );
       }
 
@@ -474,7 +492,7 @@ export const acceptJoinRequest = onCall<AcceptJoinRequestInput>(
         autoRejectedCount,
       };
     });
-  }
+  },
 );
 
 interface EndLeaseInput {
@@ -487,104 +505,96 @@ interface EndLeaseInput {
  * Callable function for landlords to end an active tenancy.
  * Preserves historical records, frees the unit, and clears activeLeaseId.
  */
-export const endLease = onCall<EndLeaseInput>(
-  async (request) => {
-    if (!request.auth) {
-      throw new HttpsError(
-        "unauthenticated",
-        "User must be authenticated."
-      );
-    }
-    const uid = request.auth.uid;
+export const endLease = onCall<EndLeaseInput>(async (request) => {
+  if (!request.auth) {
+    throw new HttpsError("unauthenticated", "User must be authenticated.");
+  }
+  const uid = request.auth.uid;
 
-    const {leaseId, endDate, endReason} = request.data || {};
-    if (!leaseId || typeof leaseId !== "string" || !leaseId.trim()) {
-      throw new HttpsError(
-        "invalid-argument",
-        "leaseId is required."
-      );
-    }
-    if (
-      !endDate ||
+  const {leaseId, endDate, endReason} = request.data || {};
+  if (!leaseId || typeof leaseId !== "string" || !leaseId.trim()) {
+    throw new HttpsError("invalid-argument", "leaseId is required.");
+  }
+  if (
+    !endDate ||
       typeof endDate !== "string" ||
       !/^\d{4}-\d{2}-\d{2}$/.test(endDate.trim())
-    ) {
+  ) {
+    throw new HttpsError(
+      "invalid-argument",
+      "endDate must be a valid YYYY-MM-DD string.",
+    );
+  }
+
+  return await db.runTransaction(async (transaction) => {
+    const leaseRef = db.collection("leases").doc(leaseId.trim());
+    const leaseDoc = await transaction.get(leaseRef);
+
+    if (!leaseDoc.exists) {
+      throw new HttpsError("not-found", "Lease document not found.");
+    }
+
+    const leaseData = leaseDoc.data();
+    if (leaseData?.landlordId !== uid) {
       throw new HttpsError(
-        "invalid-argument",
-        "endDate must be a valid YYYY-MM-DD string."
+        "permission-denied",
+        "Only the owning landlord can end this lease.",
       );
     }
 
-    return await db.runTransaction(async (transaction) => {
-      const leaseRef = db.collection("leases").doc(leaseId.trim());
-      const leaseDoc = await transaction.get(leaseRef);
+    if (leaseData?.status !== "active") {
+      throw new HttpsError(
+        "failed-precondition",
+        "Lease is already ended or not active.",
+      );
+    }
 
-      if (!leaseDoc.exists) {
-        throw new HttpsError("not-found", "Lease document not found.");
-      }
+    const joiningDate = leaseData?.joiningDate;
+    const formattedEndDate = endDate.trim();
+    if (joiningDate && formattedEndDate < joiningDate) {
+      throw new HttpsError(
+        "invalid-argument",
+        "endDate cannot be before joiningDate.",
+      );
+    }
 
-      const leaseData = leaseDoc.data();
-      if (leaseData?.landlordId !== uid) {
-        throw new HttpsError(
-          "permission-denied",
-          "Only the owning landlord can end this lease."
-        );
-      }
+    const now = FieldValue.serverTimestamp();
 
-      if (leaseData?.status !== "active") {
-        throw new HttpsError(
-          "failed-precondition",
-          "Lease is already ended or not active."
-        );
-      }
+    // Step 1: Update lease status to 'ended'
+    transaction.update(leaseRef, {
+      status: "ended",
+      endDate: formattedEndDate,
+      endReason: typeof endReason === "string" ? endReason.trim() : "",
+      endedBy: uid,
+      updatedAt: now,
+    });
 
-      const joiningDate = leaseData?.joiningDate;
-      const formattedEndDate = endDate.trim();
-      if (joiningDate && formattedEndDate < joiningDate) {
-        throw new HttpsError(
-          "invalid-argument",
-          "endDate cannot be before joiningDate."
-        );
-      }
-
-      const now = FieldValue.serverTimestamp();
-
-      // Step 1: Update lease status to 'ended'
-      transaction.update(leaseRef, {
-        status: "ended",
-        endDate: formattedEndDate,
-        endReason: typeof endReason === "string" ? endReason.trim() : "",
-        endedBy: uid,
+    // Step 2: Mark unit vacant and clear currentLeaseId
+    if (leaseData?.unitId) {
+      const unitRef = db.collection("units").doc(leaseData.unitId);
+      transaction.update(unitRef, {
+        status: "vacant",
+        currentLeaseId: null,
         updatedAt: now,
       });
+    }
 
-      // Step 2: Mark unit vacant and clear currentLeaseId
-      if (leaseData?.unitId) {
-        const unitRef = db.collection("units").doc(leaseData.unitId);
-        transaction.update(unitRef, {
-          status: "vacant",
-          currentLeaseId: null,
-          updatedAt: now,
-        });
-      }
+    // Step 3: Clear tenant activeLeaseId
+    if (leaseData?.tenantId) {
+      const tenantRef = db.collection("users").doc(leaseData.tenantId);
+      transaction.update(tenantRef, {
+        activeLeaseId: null,
+        updatedAt: now,
+      });
+    }
 
-      // Step 3: Clear tenant activeLeaseId
-      if (leaseData?.tenantId) {
-        const tenantRef = db.collection("users").doc(leaseData.tenantId);
-        transaction.update(tenantRef, {
-          activeLeaseId: null,
-          updatedAt: now,
-        });
-      }
-
-      return {
-        success: true,
-        leaseId: leaseRef.id,
-        status: "ended",
-      };
-    });
-  }
-);
+    return {
+      success: true,
+      leaseId: leaseRef.id,
+      status: "ended",
+    };
+  });
+});
 
 interface FinalizeRentChargeInput {
   rentChargeId: string;
@@ -605,8 +615,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * @return {boolean} Whether the value is a valid YYYY-MM month
  */
 function isBillingMonth(value: unknown): value is string {
-  return typeof value === "string" &&
-    /^(0[0-9]{3}|[1-9][0-9]{3})-(0[1-9]|1[0-2])$/.test(value);
+  return (
+    typeof value === "string" &&
+    /^(0[0-9]{3}|[1-9][0-9]{3})-(0[1-9]|1[0-2])$/.test(value)
+  );
 }
 
 /**
@@ -618,7 +630,7 @@ function calculateLineItemsSubtotal(value: unknown): number {
   if (!Array.isArray(value) || value.length === 0 || value.length > 10) {
     throw new HttpsError(
       "failed-precondition",
-      "Draft bill must contain between one and ten valid line items."
+      "Draft bill must contain between one and ten valid line items.",
     );
   }
 
@@ -637,7 +649,7 @@ function calculateLineItemsSubtotal(value: unknown): number {
     ) {
       throw new HttpsError(
         "failed-precondition",
-        "Draft bill contains an invalid line item."
+        "Draft bill contains an invalid line item.",
       );
     }
 
@@ -649,7 +661,7 @@ function calculateLineItemsSubtotal(value: unknown): number {
     if (!Number.isSafeInteger(subtotal)) {
       throw new HttpsError(
         "failed-precondition",
-        "Draft bill total exceeds the supported integer range."
+        "Draft bill total exceeds the supported integer range.",
       );
     }
   }
@@ -657,7 +669,7 @@ function calculateLineItemsSubtotal(value: unknown): number {
   if (rentLineItemCount !== 1) {
     throw new HttpsError(
       "failed-precondition",
-      "Draft bill must contain exactly one rent line item."
+      "Draft bill must contain exactly one rent line item.",
     );
   }
 
@@ -681,10 +693,7 @@ export const finalizeRentCharge = onCall<FinalizeRentChargeInput>(
       !rentChargeId.trim() ||
       rentChargeId.includes("/")
     ) {
-      throw new HttpsError(
-        "invalid-argument",
-        "rentChargeId is required."
-      );
+      throw new HttpsError("invalid-argument", "rentChargeId is required.");
     }
 
     const rentChargeRef = db.collection("rentCharges").doc(rentChargeId.trim());
@@ -698,38 +707,43 @@ export const finalizeRentCharge = onCall<FinalizeRentChargeInput>(
       if (rentCharge.landlordId !== uid) {
         throw new HttpsError(
           "permission-denied",
-          "Only the owning landlord can finalize this rent charge."
+          "Only the owning landlord can finalize this rent charge.",
         );
       }
       if (rentCharge.status !== "draft") {
         throw new HttpsError(
           "failed-precondition",
-          "Rent charge is not a draft."
+          "Rent charge is not a draft.",
         );
       }
 
-      const {leaseId, tenantId, propertyId, unitId, billingMonth} = rentCharge;
+      const {leaseId, tenantId, propertyId, unitId, billingMonth} =
+        rentCharge;
       if (
-        typeof leaseId !== "string" || !leaseId ||
-        typeof tenantId !== "string" || !tenantId ||
-        typeof propertyId !== "string" || !propertyId ||
-        typeof unitId !== "string" || !unitId
+        typeof leaseId !== "string" ||
+        !leaseId ||
+        typeof tenantId !== "string" ||
+        !tenantId ||
+        typeof propertyId !== "string" ||
+        !propertyId ||
+        typeof unitId !== "string" ||
+        !unitId
       ) {
         throw new HttpsError(
           "failed-precondition",
-          "Draft bill is missing a valid lease relationship."
+          "Draft bill is missing a valid lease relationship.",
         );
       }
       if (!isBillingMonth(billingMonth)) {
         throw new HttpsError(
           "invalid-argument",
-          "billingMonth must be a valid YYYY-MM value."
+          "billingMonth must be a valid YYYY-MM value.",
         );
       }
       if (rentChargeRef.id !== `${leaseId}_${billingMonth}`) {
         throw new HttpsError(
           "invalid-argument",
-          "Rent charge ID must match its lease and billing month."
+          "Rent charge ID must match its lease and billing month.",
         );
       }
 
@@ -772,7 +786,7 @@ export const finalizeRentCharge = onCall<FinalizeRentChargeInput>(
       ) {
         throw new HttpsError(
           "failed-precondition",
-          "Draft bill references do not match an active lease."
+          "Draft bill references do not match an active lease.",
         );
       }
 
@@ -787,7 +801,7 @@ export const finalizeRentCharge = onCall<FinalizeRentChargeInput>(
       ) {
         throw new HttpsError(
           "failed-precondition",
-          "Draft bill totals do not match its line items."
+          "Draft bill totals do not match its line items.",
         );
       }
 
@@ -795,7 +809,7 @@ export const finalizeRentCharge = onCall<FinalizeRentChargeInput>(
       if (rentCharge.dueDate !== dueDate) {
         throw new HttpsError(
           "failed-precondition",
-          "Draft dueDate must be the 10th of its billing month."
+          "Draft dueDate must be the 10th of its billing month.",
         );
       }
 
@@ -816,7 +830,7 @@ export const finalizeRentCharge = onCall<FinalizeRentChargeInput>(
         total: subtotal,
       };
     });
-  }
+  },
 );
 
 interface ApplyAdjustmentInput {
@@ -829,148 +843,150 @@ interface ApplyAdjustmentInput {
 /**
  * Applies an auditable correction without changing the original bill items.
  */
-export const applyAdjustment = onCall<ApplyAdjustmentInput>(
-  async (request) => {
-    if (!request.auth) {
-      throw new HttpsError("unauthenticated", "User must be authenticated.");
-    }
-    requireRole(request.auth.token.role, "landlord");
+export const applyAdjustment = onCall<ApplyAdjustmentInput>(async (request) => {
+  if (!request.auth) {
+    throw new HttpsError("unauthenticated", "User must be authenticated.");
+  }
+  requireRole(request.auth.token.role, "landlord");
 
-    const uid = request.auth.uid;
-    const {rentChargeId, amount, reason, idempotencyKey} = request.data || {};
-    if (
-      typeof rentChargeId !== "string" ||
+  const uid = request.auth.uid;
+  const {rentChargeId, amount, reason, idempotencyKey} = request.data || {};
+  if (
+    typeof rentChargeId !== "string" ||
       !rentChargeId.trim() ||
       rentChargeId.includes("/")
-    ) {
-      throw new HttpsError("invalid-argument", "rentChargeId is required.");
+  ) {
+    throw new HttpsError("invalid-argument", "rentChargeId is required.");
+  }
+  if (!Number.isSafeInteger(amount)) {
+    throw new HttpsError(
+      "invalid-argument",
+      "amount must be an integer number of paise.",
+    );
+  }
+  if (typeof reason !== "string" || !reason.trim()) {
+    throw new HttpsError("invalid-argument", "reason is required.");
+  }
+  if (
+    typeof idempotencyKey !== "string" ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      idempotencyKey,
+    )
+  ) {
+    throw new HttpsError("invalid-argument", "idempotencyKey must be a UUID.");
+  }
+
+  const normalizedIdempotencyKey = idempotencyKey.toLowerCase();
+  const rentChargeRef = db.collection("rentCharges").doc(rentChargeId.trim());
+  const adjustmentRef = rentChargeRef
+    .collection("adjustments")
+    .doc(normalizedIdempotencyKey);
+  const normalizedReason = reason.trim();
+
+  return await db.runTransaction(async (transaction) => {
+    const [rentChargeDoc, adjustmentDoc] = await Promise.all([
+      transaction.get(rentChargeRef),
+      transaction.get(adjustmentRef),
+    ]);
+    if (!rentChargeDoc.exists) {
+      throw new HttpsError("not-found", "Rent charge not found.");
     }
-    if (!Number.isSafeInteger(amount)) {
+
+    const rentCharge = rentChargeDoc.data()!;
+    if (rentCharge.landlordId !== uid) {
       throw new HttpsError(
-        "invalid-argument",
-        "amount must be an integer number of paise."
+        "permission-denied",
+        "Only the owning landlord can adjust this rent charge.",
       );
     }
-    if (typeof reason !== "string" || !reason.trim()) {
-      throw new HttpsError("invalid-argument", "reason is required.");
-    }
-    if (
-      typeof idempotencyKey !== "string" ||
-      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-        .test(idempotencyKey)
-    ) {
-      throw new HttpsError(
-        "invalid-argument",
-        "idempotencyKey must be a UUID."
-      );
-    }
 
-    const normalizedIdempotencyKey = idempotencyKey.toLowerCase();
-    const rentChargeRef = db.collection("rentCharges").doc(rentChargeId.trim());
-    const adjustmentRef = rentChargeRef
-      .collection("adjustments")
-      .doc(normalizedIdempotencyKey);
-    const normalizedReason = reason.trim();
-
-    return await db.runTransaction(async (transaction) => {
-      const [rentChargeDoc, adjustmentDoc] = await Promise.all([
-        transaction.get(rentChargeRef),
-        transaction.get(adjustmentRef),
-      ]);
-      if (!rentChargeDoc.exists) {
-        throw new HttpsError("not-found", "Rent charge not found.");
-      }
-
-      const rentCharge = rentChargeDoc.data()!;
-      if (rentCharge.landlordId !== uid) {
-        throw new HttpsError(
-          "permission-denied",
-          "Only the owning landlord can adjust this rent charge."
-        );
-      }
-
-      if (adjustmentDoc.exists) {
-        const adjustment = adjustmentDoc.data()!;
-        if (
-          adjustment.amount !== amount ||
+    if (adjustmentDoc.exists) {
+      const adjustment = adjustmentDoc.data()!;
+      if (
+        adjustment.amount !== amount ||
           adjustment.reason !== normalizedReason ||
           adjustment.createdBy !== uid
-        ) {
-          throw new HttpsError(
-            "already-exists",
-            "idempotencyKey was already used for a different adjustment."
-          );
-        }
-        return {
-          success: true,
-          adjustmentId: adjustmentDoc.id,
-          newAdjustmentTotal: rentCharge.adjustmentTotal,
-          newTotal: rentCharge.total,
-        };
-      }
-
-      if (!["finalized", "due", "overdue"].includes(rentCharge.status)) {
+      ) {
         throw new HttpsError(
-          "failed-precondition",
-          rentCharge.status === "payment_pending" ?
-            "Adjustments are not allowed while payment is pending." :
-            rentCharge.status === "paid" ?
-              "Paid rent charges cannot be adjusted." :
-              "Rent charge must be finalized before it can be adjusted."
+          "already-exists",
+          "idempotencyKey was already used for a different adjustment.",
         );
       }
+      return {
+        success: true,
+        adjustmentId: adjustmentDoc.id,
+        newAdjustmentTotal: rentCharge.adjustmentTotal,
+        newTotal: rentCharge.total,
+      };
+    }
 
-      const {subtotal, lateFineTotal, adjustmentTotal, total} = rentCharge;
-      if (
-        !Number.isSafeInteger(subtotal) ||
+    if (!["finalized", "due", "overdue"].includes(rentCharge.status)) {
+      throw new HttpsError(
+        "failed-precondition",
+        rentCharge.status === "payment_pending" ?
+          "Adjustments are not allowed while payment is pending." :
+          rentCharge.status === "paid" ?
+            "Paid rent charges cannot be adjusted." :
+            "Rent charge must be finalized before it can be adjusted.",
+      );
+    }
+
+    const {subtotal, lateFineTotal, adjustmentTotal, total} = rentCharge;
+    if (
+      !Number.isSafeInteger(subtotal) ||
         !Number.isSafeInteger(lateFineTotal) ||
         !Number.isSafeInteger(adjustmentTotal) ||
         !Number.isSafeInteger(total) ||
         !Number.isSafeInteger(subtotal + lateFineTotal + adjustmentTotal) ||
         subtotal + lateFineTotal + adjustmentTotal !== total
-      ) {
-        throw new HttpsError(
-          "failed-precondition",
-          "Rent charge totals are inconsistent."
-        );
-      }
+    ) {
+      throw new HttpsError(
+        "failed-precondition",
+        "Rent charge totals are inconsistent.",
+      );
+    }
 
-      const newAdjustmentTotal = adjustmentTotal + amount;
-      const newTotal = subtotal + lateFineTotal + newAdjustmentTotal;
-      if (
-        !Number.isSafeInteger(newAdjustmentTotal) ||
+    const newAdjustmentTotal = adjustmentTotal + amount;
+    const newTotal = subtotal + lateFineTotal + newAdjustmentTotal;
+    if (
+      !Number.isSafeInteger(newAdjustmentTotal) ||
         !Number.isSafeInteger(newTotal)
-      ) {
-        throw new HttpsError(
-          "invalid-argument",
-          "Adjustment exceeds the supported integer range."
-        );
-      }
+    ) {
+      throw new HttpsError(
+        "invalid-argument",
+        "Adjustment exceeds the supported integer range.",
+      );
+    }
+    if (newTotal <= 0) {
+      throw new HttpsError(
+        "failed-precondition",
+        "Rent charge total must remain positive after adjustment.",
+      );
+    }
 
-      const now = FieldValue.serverTimestamp();
-      transaction.create(adjustmentRef, {
-        type: "correction",
-        amount,
-        reason: normalizedReason,
-        createdBy: uid,
-        idempotencyKey: normalizedIdempotencyKey,
-        createdAt: now,
-      });
-      transaction.update(rentChargeRef, {
-        adjustmentTotal: newAdjustmentTotal,
-        total: newTotal,
-        updatedAt: now,
-      });
-
-      return {
-        success: true,
-        adjustmentId: adjustmentRef.id,
-        newAdjustmentTotal,
-        newTotal,
-      };
+    const now = FieldValue.serverTimestamp();
+    transaction.create(adjustmentRef, {
+      type: "correction",
+      amount,
+      reason: normalizedReason,
+      createdBy: uid,
+      idempotencyKey: normalizedIdempotencyKey,
+      createdAt: now,
     });
-  }
-);
+    transaction.update(rentChargeRef, {
+      adjustmentTotal: newAdjustmentTotal,
+      total: newTotal,
+      updatedAt: now,
+    });
+
+    return {
+      success: true,
+      adjustmentId: adjustmentRef.id,
+      newAdjustmentTotal,
+      newTotal,
+    };
+  });
+});
 
 /** Input accepted by authenticated device-token callables. */
 interface DeviceTokenInput {
@@ -986,11 +1002,13 @@ interface DeviceTokenInput {
  */
 function validateDeviceTokenInput(data: unknown): DeviceTokenInput {
   const input = data as Partial<DeviceTokenInput> | null;
-  if (typeof input?.expectedUid !== "string" ||
-      input.expectedUid.trim().length === 0) {
+  if (
+    typeof input?.expectedUid !== "string" ||
+    input.expectedUid.trim().length === 0
+  ) {
     throw new HttpsError(
       "invalid-argument",
-      "An expected authenticated user is required."
+      "An expected authenticated user is required.",
     );
   }
   if (
@@ -998,15 +1016,12 @@ function validateDeviceTokenInput(data: unknown): DeviceTokenInput {
     input.token.trim().length < 20 ||
     input.token.length > 4096
   ) {
-    throw new HttpsError(
-      "invalid-argument",
-      "A valid FCM token is required."
-    );
+    throw new HttpsError("invalid-argument", "A valid FCM token is required.");
   }
   if (!["android", "ios", "web"].includes(input.platform as string)) {
     throw new HttpsError(
       "invalid-argument",
-      "A supported platform is required."
+      "A supported platform is required.",
     );
   }
   return {
@@ -1019,48 +1034,47 @@ function validateDeviceTokenInput(data: unknown): DeviceTokenInput {
 /**
  * Stores an FCM token under the authenticated user's private device-token path.
  */
-export const registerDeviceToken = onCall<DeviceTokenInput>(
-  async (request) => {
-    if (!request.auth) {
-      throw new HttpsError("unauthenticated", "User must be authenticated.");
-    }
-    const {expectedUid, token, platform} =
-      validateDeviceTokenInput(request.data);
-    if (expectedUid !== request.auth.uid) {
+export const registerDeviceToken = onCall<DeviceTokenInput>(async (request) => {
+  if (!request.auth) {
+    throw new HttpsError("unauthenticated", "User must be authenticated.");
+  }
+  const {expectedUid, token, platform} = validateDeviceTokenInput(
+    request.data,
+  );
+  if (expectedUid !== request.auth.uid) {
+    throw new HttpsError(
+      "permission-denied",
+      "The authenticated user changed during token registration.",
+    );
+  }
+  const userRef = db.collection("users").doc(request.auth.uid);
+  const tokenRef = userRef
+    .collection("deviceTokens")
+    .doc(deviceTokenDocumentId(token));
+
+  await db.runTransaction(async (transaction) => {
+    const [user, existingToken] = await Promise.all([
+      transaction.get(userRef),
+      transaction.get(tokenRef),
+    ]);
+    if (!user.exists || !["landlord", "tenant"].includes(user.get("role"))) {
       throw new HttpsError(
-        "permission-denied",
-        "The authenticated user changed during token registration."
+        "failed-precondition",
+        "Complete onboarding before registering notifications.",
       );
     }
-    const userRef = db.collection("users").doc(request.auth.uid);
-    const tokenRef = userRef.collection("deviceTokens")
-      .doc(deviceTokenDocumentId(token));
 
-    await db.runTransaction(async (transaction) => {
-      const [user, existingToken] = await Promise.all([
-        transaction.get(userRef),
-        transaction.get(tokenRef),
-      ]);
-      if (!user.exists || !["landlord", "tenant"].includes(user.get("role"))) {
-        throw new HttpsError(
-          "failed-precondition",
-          "Complete onboarding before registering notifications."
-        );
-      }
-
-      const now = FieldValue.serverTimestamp();
-      transaction.set(tokenRef, {
-        token,
-        platform,
-        createdAt: existingToken.exists ?
-          existingToken.get("createdAt") : now,
-        updatedAt: now,
-      });
+    const now = FieldValue.serverTimestamp();
+    transaction.set(tokenRef, {
+      token,
+      platform,
+      createdAt: existingToken.exists ? existingToken.get("createdAt") : now,
+      updatedAt: now,
     });
+  });
 
-    return {success: true};
-  }
-);
+  return {success: true};
+});
 
 /**
  * Removes only the current authenticated user's registered device token.
@@ -1068,29 +1082,137 @@ export const registerDeviceToken = onCall<DeviceTokenInput>(
 export const unregisterDeviceToken = onCall<{
   expectedUid: string;
   token: string;
-}>(
+}>(async (request) => {
+  if (!request.auth) {
+    throw new HttpsError("unauthenticated", "User must be authenticated.");
+  }
+  const {expectedUid, token} = validateDeviceTokenInput({
+    expectedUid: request.data?.expectedUid,
+    token: request.data?.token,
+    platform: "android",
+  });
+  if (expectedUid !== request.auth.uid) {
+    throw new HttpsError(
+      "permission-denied",
+      "The authenticated user changed before token removal.",
+    );
+  }
+  await db
+    .collection("users")
+    .doc(request.auth.uid)
+    .collection("deviceTokens")
+    .doc(deviceTokenDocumentId(token))
+    .delete();
+  return {success: true};
+});
+
+export const preparePaymentProofUpload = onCall<PreparePaymentUploadInput>(
+  {secrets: [paymentUploadTokenSecret]},
   async (request) => {
     if (!request.auth) {
       throw new HttpsError("unauthenticated", "User must be authenticated.");
     }
-    const {expectedUid, token} = validateDeviceTokenInput({
-      expectedUid: request.data?.expectedUid,
-      token: request.data?.token,
-      platform: "android",
+    requireRole(request.auth.token.role, "tenant");
+    const service = createPaymentUploadService({
+      db,
+      uploadUrl: paymentProofUploadUrl(request),
+      tokenSecret: paymentUploadTokenSecret.value(),
     });
-    if (expectedUid !== request.auth.uid) {
-      throw new HttpsError(
-        "permission-denied",
-        "The authenticated user changed before token removal."
-      );
+    return service.prepare(
+      request.auth?.uid,
+      request.auth?.token.role,
+      request.data,
+    );
+  },
+);
+
+export const createUpiPayment = onCall<CreateUpiPaymentInput>(
+  {
+    secrets: [cloudinaryCloudName, cloudinaryApiKey, cloudinaryApiSecret],
+  },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "User must be authenticated.");
     }
-    await db.collection("users")
-      .doc(request.auth.uid)
-      .collection("deviceTokens")
-      .doc(deviceTokenDocumentId(token))
-      .delete();
-    return {success: true};
-  }
+    requireRole(request.auth.token.role, "tenant");
+    const service = createPaymentUploadService({
+      db,
+      cloudinary: createCloudinaryGateway({
+        cloudName: cloudinaryCloudName.value(),
+        apiKey: cloudinaryApiKey.value(),
+        apiSecret: cloudinaryApiSecret.value(),
+      }),
+    });
+    return service.create(
+      request.auth.uid,
+      request.auth.token.role,
+      request.data,
+    );
+  },
+);
+
+export const verifyUpiPayment = onCall<VerifyUpiPaymentInput>(
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "User must be authenticated.");
+    }
+    requireRole(request.auth.token.role, "landlord");
+    const service = createPaymentUploadService({db});
+    return service.verify(
+      request.auth.uid,
+      request.auth.token.role,
+      request.data,
+    );
+  },
+);
+
+export const uploadPaymentProof = onRequest(
+  {
+    secrets: [
+      cloudinaryCloudName,
+      cloudinaryApiKey,
+      cloudinaryApiSecret,
+      paymentUploadTokenSecret,
+    ],
+    timeoutSeconds: 120,
+    memory: "512MiB",
+  },
+  async (request, response) => {
+    await createPaymentUploadHttpHandler(
+      () =>
+        createPaymentUploadService({
+          db,
+          tokenSecret: paymentUploadTokenSecret.value(),
+          cloudinary: createCloudinaryGateway({
+            cloudName: cloudinaryCloudName.value(),
+            apiKey: cloudinaryApiKey.value(),
+            apiSecret: cloudinaryApiSecret.value(),
+          }),
+        }),
+      (error) => logger.error("Payment proof upload failed.", error),
+    )(request, response);
+  },
+);
+
+export const recoverPaymentProofCleanup = onSchedule(
+  {
+    schedule: "every 15 minutes",
+    timeZone: "Etc/UTC",
+    retryCount: 1,
+    maxRetrySeconds: 300,
+    secrets: [cloudinaryCloudName, cloudinaryApiKey, cloudinaryApiSecret],
+  },
+  async () => {
+    const service = createPaymentUploadService({
+      db,
+      cloudinary: createCloudinaryGateway({
+        cloudName: cloudinaryCloudName.value(),
+        apiKey: cloudinaryApiKey.value(),
+        apiSecret: cloudinaryApiSecret.value(),
+      }),
+    });
+    await service.recoverCleanup();
+  },
 );
 
 export const send25thLandlordReminder = onSchedule(
@@ -1102,7 +1224,7 @@ export const send25thLandlordReminder = onSchedule(
   },
   async (event) => {
     await run25thLandlordReminder(db, event.scheduleTime);
-  }
+  },
 );
 
 export const send1stTenantNotifications = onSchedule(
@@ -1114,7 +1236,7 @@ export const send1stTenantNotifications = onSchedule(
   },
   async (event) => {
     await run1stTenantNotifications(db, event.scheduleTime);
-  }
+  },
 );
 
 export const expandNotificationDelivery = onDocumentCreated(
@@ -1125,7 +1247,7 @@ export const expandNotificationDelivery = onDocumentCreated(
   async (event) => {
     const notificationId = event.params.notificationId;
     await expandNotificationDeliveries(db, notificationId);
-  }
+  },
 );
 
 export const deliverNotificationToRegisteredDevice = onDocumentCreated(
@@ -1140,9 +1262,9 @@ export const deliverNotificationToRegisteredDevice = onDocumentCreated(
         notificationId: event.params.notificationId,
         tokenHash: event.params.tokenHash,
       },
-      (message) => getMessaging().send(message)
+      (message) => getMessaging().send(message),
     );
-  }
+  },
 );
 
 export const recoverNotificationDeliveries = onSchedule(
@@ -1153,11 +1275,10 @@ export const recoverNotificationDeliveries = onSchedule(
     maxRetrySeconds: 300,
   },
   async () => {
-    await recoverNotificationDeliveryTasks(
-      db,
-      (message) => getMessaging().send(message)
+    await recoverNotificationDeliveryTasks(db, (message) =>
+      getMessaging().send(message),
     );
-  }
+  },
 );
 
 export {
