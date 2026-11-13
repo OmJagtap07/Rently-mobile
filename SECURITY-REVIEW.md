@@ -77,3 +77,50 @@ No confirmed exploitable vulnerability was identified in the reviewed upload inf
 - Payment Firestore Rules tests passed: 11 tests; 123 non-payment tests were skipped.
 - `git diff --check` and Firestore index JSON parsing passed.
 - Live Cloudinary operations were not performed; emulator tests use a mock Cloudinary adapter.
+---
+
+# Phase 5 Task 5C-6 — Landlord UPI Payment Review UI Security Review
+
+**Review date:** 2026-11-13
+**Scope:** Landlord payment-review repository, screen, dashboard navigation, tests, callable integration, and Firestore composite index.
+
+## Assessment
+
+No confirmed security vulnerabilities were found. The UI is acceptable, with emulator-backed payment integration testing recommended before end-to-end sign-off.
+
+## Findings — Test coverage gaps
+
+### Medium — Firebase repository authorization and query behavior are not directly tested
+
+- **Files and lines:** `app/lib/services/landlord_payment_review_repository.dart:269-288`; `app/test/landlord_payment_review_repository_test.dart:99-134`
+- **Confidence:** 8/10
+- The repository checks the authenticated user's landlord role and scopes the pending-payment query by that user's UID. Existing tests cover record mapping and a linked-record mismatch, but do not directly exercise the Firebase auth claim, query scope, or configured callable region.
+- **Assessment:** This is a coverage gap, not a confirmed authorization defect. Callable role tests and Firestore Rules independently enforce landlord authorization.
+
+### Low — Proof-image and network/session error fallbacks are not directly tested
+
+- **Files and lines:** `app/lib/dashboards/landlord/landlord_payment_review_screen.dart:186-201, 277-295`; `app/test/landlord_payment_review_screen_test.dart:23-52, 140-164`
+- **Confidence:** 8/10
+- Widget tests cover proof display/viewing and a failed-precondition callable response, but not missing, invalid, deleted, or inaccessible proof images, nor the mapped network and expired-session errors.
+- **Assessment:** The screen provides image fallbacks and actionable error messages; those cases remain unverified by focused tests.
+
+## Controls reviewed
+
+- The repository checks the authenticated user's `role` claim and queries `payments` by that user's `landlordId` and `pending_verification` status. Firestore Rules additionally scope payment reads to the owning landlord.
+- The repository validates payment, lease, and rent-charge identifiers and ownership fields. The callable independently validates payment, bill, lease, property, unit, tenant, and landlord relationships.
+- Historical payments use the payment's linked lease and rent-charge records; the UI does not require the unit's current lease assignment to match.
+- The UI invokes `verifyUpiPayment` using the default `us-central1` region and sends only `accept` or `reject`. Predefined rejection reasons omit `rejectionExplanation`; `Other` explanations are trimmed and limited to 10-500 characters.
+- The UI prevents concurrent submissions, refreshes the queue after success, and relies on the callable's idempotency and conflict rejection for retries.
+- Proof URLs are checked for HTTPS and expected Cloudinary image metadata. Failed image loads render fallback text.
+- The composite index matches the collection query's ascending `landlordId` and `status` fields. The index was not deployed during this review.
+
+## Validation notes
+
+- Landlord payment-review Flutter tests passed: 15 tests.
+- Callable role tests passed: 19 tests.
+- The emulator-backed payment integration suite stalled and did not complete. The full payment decision workflow therefore remains unverified end-to-end.
+- A prior full Flutter test run passed 91 tests.
+
+## Recommendation
+
+Accept the UI implementation. Run the emulator-backed payment integration suite before treating the full verification flow as validated.
