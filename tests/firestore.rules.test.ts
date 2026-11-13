@@ -16,10 +16,17 @@ import {
   query,
   where,
   getDocs,
-  setLogLevel
+  setLogLevel,
+  Timestamp
 } from 'firebase/firestore';
 
 let testEnv: RulesTestEnvironment;
+
+const validPropertyUpiConfig = {
+  upiId: 'owner@bank',
+  upiQrImageUrl: 'https://images.example.com/qr.png',
+  upiDisplayName: 'Property Owner'
+};
 
 beforeAll(async () => {
   setLogLevel('error');
@@ -46,7 +53,14 @@ beforeEach(async () => {
     await setDoc(doc(db, 'users', 'tenantB'), { uid: 'tenantB', role: 'tenant', fullName: 'TB', activeLeaseId: null });
 
     // 2. properties
-    await setDoc(doc(db, 'properties', 'propertyA1'), { landlordId: 'landlordA', status: 'active', name: 'Prop A1' });
+    await setDoc(doc(db, 'properties', 'propertyA1'), {
+      landlordId: 'landlordA',
+      status: 'active',
+      name: 'Prop A1',
+      upiId: validPropertyUpiConfig.upiId,
+      upiQrImageUrl: validPropertyUpiConfig.upiQrImageUrl,
+      upiDisplayName: validPropertyUpiConfig.upiDisplayName
+    });
     await setDoc(doc(db, 'properties', 'propertyB1'), { landlordId: 'landlordB', status: 'active', name: 'Prop B1' });
 
     // 3. units
@@ -65,10 +79,14 @@ beforeEach(async () => {
       propertyId: 'propertyA1',
       unitId: 'unitA1',
       billingMonth: '2026-10',
+      lineItems: [{ type: 'rent', label: 'Rent', amount: 1000 }],
+      dueDate: '2026-10-10',
       lateFineTotal: 0,
       adjustmentTotal: 0,
       subtotal: 1000,
-      total: 1000
+      total: 1000,
+      createdAt: Timestamp.now(),
+      updatedAt: Timestamp.now()
     });
     
     await setDoc(doc(db, 'rentCharges', 'leaseA1_2026-09'), {
@@ -164,7 +182,10 @@ describe('2. users', () => {
 describe('3. properties', () => {
   it('P-1 landlordA Create own property -> ALLOW', async () => {
     const db = getContext('landlord', 'landlordA').firestore();
-    await assertSucceeds(setDoc(doc(db, 'properties', 'newProp1'), { landlordId: 'landlordA' }));
+    await assertSucceeds(setDoc(doc(db, 'properties', 'newProp1'), {
+      landlordId: 'landlordA',
+      ...validPropertyUpiConfig
+    }));
   });
   it('P-2 landlordA Create property for landlordB -> DENY', async () => {
     const db = getContext('landlord', 'landlordA').firestore();
@@ -201,6 +222,73 @@ describe('3. properties', () => {
   it('P-10 landlordA Delete property -> DENY', async () => {
     const db = getContext('landlord', 'landlordA').firestore();
     await assertFails(deleteDoc(doc(db, 'properties', 'propertyA1')));
+  });
+  it('P-11 landlordA configures valid property UPI details -> ALLOW', async () => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    await assertSucceeds(updateDoc(doc(db, 'properties', 'propertyA1'), {
+      ...validPropertyUpiConfig,
+      updatedAt: Timestamp.now()
+    }));
+  });
+  it('P-12 tenantA reads property UPI details but cannot change them -> DENY', async () => {
+    const db = getContext('tenant', 'tenantA').firestore();
+    const property = await getDoc(doc(db, 'properties', 'propertyA1'));
+    expect(property.data()?.upiId).toBe('owner@bank');
+    await assertFails(updateDoc(doc(db, 'properties', 'propertyA1'), {
+      upiId: 'attacker@bank'
+    }));
+  });
+  it('P-13 landlordB cannot configure propertyA1 UPI details -> DENY', async () => {
+    const db = getContext('landlord', 'landlordB').firestore();
+    await assertFails(updateDoc(doc(db, 'properties', 'propertyA1'), {
+      ...validPropertyUpiConfig
+    }));
+  });
+  it.each([
+    ['invalid UPI ID', { ...validPropertyUpiConfig, upiId: 'not-a-vpa' }],
+    ['non-HTTPS QR URL', { ...validPropertyUpiConfig, upiQrImageUrl: 'http://images.example.com/qr.png' }],
+    ['malformed QR host', { ...validPropertyUpiConfig, upiQrImageUrl: 'https://-invalid.example/qr.png' }],
+    ['blank recipient name', { ...validPropertyUpiConfig, upiDisplayName: '   ' }]
+  ])('P-14 landlordA cannot create property with %s -> DENY', async (_caseName, config) => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    await assertFails(setDoc(doc(db, 'properties', `invalid-${_caseName}`), {
+      landlordId: 'landlordA',
+      ...config
+    }));
+  });
+  it('P-15 rejects invalid UPI configuration on owner update -> DENY', async () => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    await assertFails(updateDoc(doc(db, 'properties', 'propertyA1'), {
+      upiId: 'not-a-vpa'
+    }));
+  });
+});
+
+describe('3a. server-only notification delivery data', () => {
+  it('denies clients reading or writing device tokens', async () => {
+    const db = getContext('tenant', 'tenantA').firestore();
+    const tokenRef = doc(db, 'users', 'tenantA', 'deviceTokens', 'tokenHash');
+
+    await assertFails(getDoc(tokenRef));
+    await assertFails(setDoc(tokenRef, { token: 'secret-token' }));
+    await assertFails(deleteDoc(tokenRef));
+  });
+
+  it('denies clients reading or writing notification delivery records', async () => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    const deliveryRef = doc(db, 'notificationDeliveries', 'notificationA');
+    const deviceDeliveryRef = doc(
+      db,
+      'notificationDeliveries',
+      'notificationA',
+      'devices',
+      'tokenHash'
+    );
+
+    await assertFails(getDoc(deliveryRef));
+    await assertFails(setDoc(deliveryRef, { status: 'pending' }));
+    await assertFails(getDoc(deviceDeliveryRef));
+    await assertFails(setDoc(deviceDeliveryRef, { status: 'pending' }));
   });
 });
 
@@ -326,8 +414,14 @@ describe('7. rentCharges', () => {
     propertyId: 'propertyA1',
     unitId: 'unitA1',
     billingMonth: '2026-11',
+    lineItems: [{ type: 'rent', label: 'Rent', amount: 1000 }],
+    subtotal: 1000,
     lateFineTotal: 0,
-    adjustmentTotal: 0
+    adjustmentTotal: 0,
+    total: 1000,
+    dueDate: '2026-11-10',
+    createdAt: Timestamp.now(),
+    updatedAt: Timestamp.now()
   };
 
   it('RC-1 landlordA Create valid draft -> ALLOW', async () => {
@@ -349,7 +443,11 @@ describe('7. rentCharges', () => {
   });
   it('RC-5 landlordA Edit draft lineItems/subtotal -> ALLOW', async () => {
     const db = getContext('landlord', 'landlordA').firestore();
-    await assertSucceeds(updateDoc(doc(db, 'rentCharges', 'leaseA1_2026-10'), { subtotal: 1200 }));
+    await assertSucceeds(updateDoc(doc(db, 'rentCharges', 'leaseA1_2026-10'), {
+      lineItems: [{ type: 'rent', label: 'Rent', amount: 1200 }],
+      subtotal: 1200,
+      total: 1200
+    }));
   });
   it('RC-6 landlordA Edit finalized bill -> DENY', async () => {
     const db = getContext('landlord', 'landlordA').firestore();
@@ -398,6 +496,248 @@ describe('7. rentCharges', () => {
   it('RC-17 landlordA Create wrong unitId -> DENY', async () => {
     const db = getContext('landlord', 'landlordA').firestore();
     await assertFails(setDoc(doc(db, 'rentCharges', 'leaseA1_2026-11'), { ...validDraftData, unitId: 'unitB1' }));
+  });
+  it('RC-18 landlordA Create invalid billing month -> DENY', async () => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    await assertFails(setDoc(doc(db, 'rentCharges', 'leaseA1_2026-13'), { ...validDraftData, billingMonth: '2026-13' }));
+  });
+  it('RC-19 landlordA Create draft for ended lease -> DENY', async () => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    await assertFails(setDoc(
+      doc(db, 'rentCharges', 'leaseEnded_2026-11'),
+      { ...validDraftData, leaseId: 'leaseEnded' }
+    ));
+  });
+  it('RC-20 landlordA Create draft when tenant no longer points to lease -> DENY', async () => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    await testEnv.withSecurityRulesDisabled(async (context) => {
+      await updateDoc(doc(context.firestore(), 'users', 'tenantA'), {
+        activeLeaseId: null
+      });
+    });
+    await assertFails(setDoc(
+      doc(db, 'rentCharges', 'leaseA1_2026-11'),
+      validDraftData
+    ));
+  });
+  it('RC-21 landlordA Create draft with mismatched total -> DENY', async () => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    await assertFails(setDoc(
+      doc(db, 'rentCharges', 'leaseA1_2026-11'),
+      { ...validDraftData, total: 999 }
+    ));
+  });
+  it('RC-22 landlordA Edit draft with mismatched total -> DENY', async () => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    await assertFails(updateDoc(doc(db, 'rentCharges', 'leaseA1_2026-10'), {
+      subtotal: 1200,
+      total: 1000
+    }));
+  });
+  it.each([
+    ['unsupported type', [{ type: 'tax', label: 'Tax', amount: 1 }]],
+    ['missing label', [{ type: 'other', amount: 1 }]],
+    ['fractional paise', [{ type: 'other', label: 'Other', amount: 1.5 }]],
+    ['undeclared item field', [{ type: 'other', label: 'Other', amount: 1, extra: true }]]
+  ])('RC-24 landlordA Create draft with %s -> DENY', async (_caseName, lineItems) => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    await assertFails(setDoc(
+      doc(db, 'rentCharges', 'leaseA1_2026-11'),
+      { ...validDraftData, lineItems }
+    ));
+  });
+  it('RC-33 landlordA Create draft with a negative charge -> DENY', async () => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    const lineItems = [
+      { type: 'rent', label: 'Rent', amount: 1000 },
+      { type: 'electricity', label: 'Electricity', amount: -1 }
+    ];
+    await assertFails(setDoc(
+      doc(db, 'rentCharges', 'leaseA1_2026-11'),
+      { ...validDraftData, lineItems, subtotal: 999, total: 999 }
+    ));
+  });
+  it('RC-30 landlordA Create draft with a whitespace-only label -> DENY', async () => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    const lineItems = [{ type: 'rent', label: ' \t\n ', amount: 1000 }];
+    await assertFails(setDoc(
+      doc(db, 'rentCharges', 'leaseA1_2026-11'),
+      { ...validDraftData, lineItems }
+    ));
+  });
+  it.each([
+    ['missing', [{ type: 'electricity', label: 'Electricity', amount: 1000 }]],
+    ['duplicate', [
+      { type: 'rent', label: 'Rent', amount: 1000 },
+      { type: 'rent', label: 'Second rent', amount: 0 }
+    ]]
+  ])('RC-31 landlordA Create draft with %s rent item -> DENY', async (_caseName, lineItems) => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    const subtotal = lineItems.reduce((sum, item) => sum + item.amount, 0);
+    await assertFails(setDoc(
+      doc(db, 'rentCharges', 'leaseA1_2026-11'),
+      { ...validDraftData, lineItems, subtotal, total: subtotal }
+    ));
+  });
+  it('RC-25 landlordA Create draft with subtotal not matching line items -> DENY', async () => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    await assertFails(setDoc(
+      doc(db, 'rentCharges', 'leaseA1_2026-11'),
+      { ...validDraftData, subtotal: 999, total: 999 }
+    ));
+  });
+  it('RC-26 landlordA Create draft with an undeclared document field -> DENY', async () => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    await assertFails(setDoc(
+      doc(db, 'rentCharges', 'leaseA1_2026-11'),
+      { ...validDraftData, unexpected: 'not in schema' }
+    ));
+  });
+  it('RC-27 landlordA Edit draft with subtotal not matching line items -> DENY', async () => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    await assertFails(updateDoc(doc(db, 'rentCharges', 'leaseA1_2026-10'), {
+      lineItems: [{ type: 'rent', label: 'Rent', amount: 1200 }],
+      subtotal: 1100,
+      total: 1100
+    }));
+  });
+  it('RC-34 landlordA Edit draft with a negative line-item amount -> DENY', async () => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    const lineItems = [
+      { type: 'rent', label: 'Rent', amount: 1000 },
+      { type: 'electricity', label: 'Electricity', amount: -1 }
+    ];
+    await assertFails(updateDoc(doc(db, 'rentCharges', 'leaseA1_2026-10'), {
+      lineItems,
+      subtotal: 999,
+      total: 999
+    }));
+  });
+  it('RC-35 landlordA Edit draft without a rent item -> DENY', async () => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    const lineItems = [
+      { type: 'electricity', label: 'Electricity', amount: 1000 }
+    ];
+    await assertFails(updateDoc(doc(db, 'rentCharges', 'leaseA1_2026-10'), {
+      lineItems,
+      subtotal: 1000,
+      total: 1000
+    }));
+  });
+  it('RC-36 landlordA Edit draft with duplicate rent items -> DENY', async () => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    const lineItems = [
+      { type: 'rent', label: 'Rent', amount: 1000 },
+      { type: 'rent', label: 'Second rent', amount: 0 }
+    ];
+    await assertFails(updateDoc(doc(db, 'rentCharges', 'leaseA1_2026-10'), {
+      lineItems,
+      subtotal: 1000,
+      total: 1000
+    }));
+  });
+  it('RC-37 landlordA Edit draft with a whitespace-only label -> DENY', async () => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    const lineItems = [{ type: 'rent', label: ' \t\n ', amount: 1000 }];
+    await assertFails(updateDoc(doc(db, 'rentCharges', 'leaseA1_2026-10'), {
+      lineItems,
+      subtotal: 1000,
+      total: 1000
+    }));
+  });
+  it('RC-38 landlordA Edit draft with more than ten line items -> DENY', async () => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    const lineItems = [
+      { type: 'rent', label: 'Rent', amount: 1 },
+      ...Array.from({ length: 10 }, (_, index) => ({
+        type: 'other',
+        label: `Other ${index + 1}`,
+        amount: 1
+      }))
+    ];
+    await assertFails(updateDoc(doc(db, 'rentCharges', 'leaseA1_2026-10'), {
+      lineItems,
+      subtotal: 11,
+      total: 11
+    }));
+  });
+  it('RC-39 landlordA Edit draft with a valid line item remains allowed', async () => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    const lineItems = [{ type: 'rent', label: 'Rent', amount: 1200 }];
+    await assertSucceeds(updateDoc(doc(db, 'rentCharges', 'leaseA1_2026-10'), {
+      lineItems,
+      subtotal: 1200,
+      total: 1200
+    }));
+  });
+  it('RC-32 landlordA Read draft after lease termination -> ALLOW, edit -> DENY', async () => {
+    await testEnv.withSecurityRulesDisabled(async (context) => {
+      const db = context.firestore();
+      await updateDoc(doc(db, 'leases', 'leaseA1'), { status: 'ended' });
+      await updateDoc(doc(db, 'users', 'tenantA'), { activeLeaseId: null });
+      await updateDoc(doc(db, 'units', 'unitA1'), {
+        status: 'vacant',
+        currentLeaseId: null
+      });
+    });
+
+    const db = getContext('landlord', 'landlordA').firestore();
+    const draftRef = doc(db, 'rentCharges', 'leaseA1_2026-10');
+    await assertSucceeds(getDoc(draftRef));
+    await assertFails(updateDoc(draftRef, {
+      lineItems: [{ type: 'rent', label: 'Rent', amount: 1200 }],
+      subtotal: 1200,
+      total: 1200
+    }));
+  });
+  it('RC-28 landlordA Create draft with ten valid line items -> ALLOW', async () => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    const lineItems = [
+      { type: 'rent', label: 'Rent', amount: 1 },
+      ...Array.from({ length: 9 }, (_, index) => ({
+        type: 'other',
+        label: `Other ${index + 1}`,
+        amount: 1
+      }))
+    ];
+    await assertSucceeds(setDoc(
+      doc(db, 'rentCharges', 'leaseA1_2026-11'),
+      { ...validDraftData, lineItems, subtotal: 10, total: 10 }
+    ));
+  });
+  it('RC-29 landlordA Create draft with more than ten line items -> DENY', async () => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    const lineItems = [
+      { type: 'rent', label: 'Rent', amount: 1 },
+      ...Array.from({ length: 10 }, (_, index) => ({
+        type: 'other',
+        label: `Other ${index + 1}`,
+        amount: 1
+      }))
+    ];
+    await assertFails(setDoc(
+      doc(db, 'rentCharges', 'leaseA1_2026-11'),
+      { ...validDraftData, lineItems, subtotal: 11, total: 11 }
+    ));
+  });
+  it('RC-23 landlordA Reuse deterministic draft ID -> one bill per month', async () => {
+    const db = getContext('landlord', 'landlordA').firestore();
+    const billRef = doc(db, 'rentCharges', 'leaseA1_2026-11');
+    await assertSucceeds(setDoc(billRef, validDraftData));
+    await assertSucceeds(updateDoc(billRef, {
+      lineItems: [{ type: 'rent', label: 'Rent', amount: 2000 }],
+      subtotal: 2000,
+      total: 2000
+    }));
+
+    const matchingBills = await getDocs(query(
+      collection(db, 'rentCharges'),
+      where('landlordId', '==', 'landlordA'),
+      where('leaseId', '==', 'leaseA1'),
+      where('billingMonth', '==', '2026-11')
+    ));
+    expect(matchingBills.size).toBe(1);
+    expect(matchingBills.docs[0].data().total).toBe(2000);
   });
 });
 
@@ -566,5 +906,3 @@ describe('12. Collection Queries', () => {
     await assertFails(getDocs(q));
   });
 });
-
-

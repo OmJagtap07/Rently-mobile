@@ -3,6 +3,10 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 
 import '../auth/auth_service.dart';
 import '../services/property_service.dart';
+import '../services/property_payment_details.dart';
+import '../services/landlord_payment_review_repository.dart';
+import 'landlord/landlord_payment_review_screen.dart';
+import 'landlord/monthly_billing_screen.dart';
 import 'landlord/property_details_screen.dart';
 
 class NoAvailableUnitsNotice extends StatelessWidget {
@@ -32,6 +36,8 @@ class LandlordDashboardScreen extends StatefulWidget {
 class _LandlordDashboardScreenState extends State<LandlordDashboardScreen> {
   int _currentIndex = 0;
   final PropertyService _propertyService = PropertyService();
+  final LandlordPaymentReviewRepository _paymentReviewRepository =
+      FirebaseLandlordPaymentReviewRepository();
 
   // ───────────────────────── ADD PROPERTY DIALOG ─────────────────────────
 
@@ -39,6 +45,9 @@ class _LandlordDashboardScreenState extends State<LandlordDashboardScreen> {
     final nameCtrl = TextEditingController();
     final addressCtrl = TextEditingController();
     final mapsCtrl = TextEditingController();
+    final upiIdCtrl = TextEditingController();
+    final upiQrImageUrlCtrl = TextEditingController();
+    final upiDisplayNameCtrl = TextEditingController();
     final formKey = GlobalKey<FormState>();
     bool isSaving = false;
 
@@ -88,6 +97,38 @@ class _LandlordDashboardScreenState extends State<LandlordDashboardScreen> {
                           border: OutlineInputBorder(),
                         ),
                       ),
+                      const SizedBox(height: 12),
+                      TextFormField(
+                        controller: upiIdCtrl,
+                        keyboardType: TextInputType.emailAddress,
+                        decoration: const InputDecoration(
+                          labelText: 'Property UPI ID *',
+                          hintText: 'name@bank',
+                          border: OutlineInputBorder(),
+                        ),
+                        validator: validateUpiId,
+                      ),
+                      const SizedBox(height: 12),
+                      TextFormField(
+                        controller: upiQrImageUrlCtrl,
+                        keyboardType: TextInputType.url,
+                        decoration: const InputDecoration(
+                          labelText: 'UPI QR Image HTTPS URL *',
+                          hintText: 'https://...',
+                          border: OutlineInputBorder(),
+                        ),
+                        validator: validateUpiQrImageUrl,
+                      ),
+                      const SizedBox(height: 12),
+                      TextFormField(
+                        controller: upiDisplayNameCtrl,
+                        textCapitalization: TextCapitalization.words,
+                        decoration: const InputDecoration(
+                          labelText: 'UPI Recipient Display Name *',
+                          border: OutlineInputBorder(),
+                        ),
+                        validator: validateUpiDisplayName,
+                      ),
                     ],
                   ),
                 ),
@@ -107,9 +148,12 @@ class _LandlordDashboardScreenState extends State<LandlordDashboardScreen> {
                             await _propertyService.createProperty(
                               name: nameCtrl.text.trim(),
                               address: addressCtrl.text.trim(),
+                              upiId: upiIdCtrl.text.trim(),
+                              upiQrImageUrl: upiQrImageUrlCtrl.text.trim(),
+                              upiDisplayName: upiDisplayNameCtrl.text.trim(),
                               googleMapsLink: mapsCtrl.text.trim(),
                             );
-                            if (!mounted) return;
+                            if (!mounted || !dialogCtx.mounted) return;
                             Navigator.pop(dialogCtx);
                             ScaffoldMessenger.of(context).showSnackBar(
                               const SnackBar(
@@ -117,6 +161,7 @@ class _LandlordDashboardScreenState extends State<LandlordDashboardScreen> {
                               ),
                             );
                           } catch (e) {
+                            if (!mounted || !dialogCtx.mounted) return;
                             setDialogState(() => isSaving = false);
                             ScaffoldMessenger.of(context).showSnackBar(
                               SnackBar(
@@ -624,9 +669,12 @@ class _LandlordDashboardScreenState extends State<LandlordDashboardScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(
-          _currentIndex == 0 ? 'Properties & Rooms' : 'Join Requests',
-        ),
+        title: Text(switch (_currentIndex) {
+          0 => 'Properties & Rooms',
+          1 => 'Join Requests',
+          2 => 'Monthly Billing',
+          _ => 'Payment Review',
+        }),
         actions: [
           IconButton(
             icon: const Icon(Icons.logout),
@@ -635,9 +683,12 @@ class _LandlordDashboardScreenState extends State<LandlordDashboardScreen> {
           ),
         ],
       ),
-      body: _currentIndex == 0
-          ? _buildPropertiesTab()
-          : _buildJoinRequestsTab(),
+      body: switch (_currentIndex) {
+        0 => _buildPropertiesTab(),
+        1 => _buildJoinRequestsTab(),
+        2 => MonthlyBillingScreen(repository: _propertyService),
+        _ => LandlordPaymentReviewScreen(repository: _paymentReviewRepository),
+      },
       floatingActionButton: _currentIndex == 0
           ? FloatingActionButton.extended(
               onPressed: _showAddPropertyDialog,
@@ -658,6 +709,16 @@ class _LandlordDashboardScreenState extends State<LandlordDashboardScreen> {
             icon: Icon(Icons.mark_email_unread_outlined),
             selectedIcon: Icon(Icons.mark_email_unread),
             label: 'Join Requests',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.receipt_long_outlined),
+            selectedIcon: Icon(Icons.receipt_long),
+            label: 'Billing',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.fact_check_outlined),
+            selectedIcon: Icon(Icons.fact_check),
+            label: 'Payments',
           ),
         ],
       ),

@@ -5,6 +5,8 @@ import 'package:cloud_functions/cloud_functions.dart';
 
 import '../auth/auth_service.dart';
 import '../services/property_service.dart';
+import 'tenant/tenant_billing_screen.dart';
+import '../widgets/property_upi_payment_info_card.dart';
 
 class PendingJoinRequestAvailabilityMessage extends StatelessWidget {
   const PendingJoinRequestAvailabilityMessage({super.key});
@@ -308,6 +310,12 @@ class _TenantDashboardScreenState extends State<TenantDashboardScreen> {
                               ),
                             ],
                           ),
+                          const SizedBox(height: 12),
+                          PropertyUpiPaymentInfoCard(
+                            upiId: propData?['upiId'] as String?,
+                            qrImageUrl: propData?['upiQrImageUrl'] as String?,
+                            displayName: propData?['upiDisplayName'] as String?,
+                          ),
                           const SizedBox(height: 6),
                           Row(
                             children: [
@@ -567,6 +575,13 @@ class _TenantDashboardScreenState extends State<TenantDashboardScreen> {
       appBar: AppBar(
         title: const Text('Tenant Dashboard'),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.receipt_long_outlined),
+            tooltip: 'Rent Bills',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(builder: (_) => TenantBillingScreen()),
+            ),
+          ),
           IconButton(
             icon: const Icon(Icons.logout),
             tooltip: 'Sign Out',

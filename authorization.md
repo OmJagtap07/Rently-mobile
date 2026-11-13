@@ -1,9 +1,9 @@
 # Rently 2.0 — Authorization Model (Phase 2, Frozen)
 
 **Status:** Frozen for implementation
-**Version:** 1.1
-**Date:** 26 September 2026
-**Depends on:** `schema.md` v1.3
+**Version:** 1.3 — approved UPI payment defaults
+**Date:** 12 November 2026
+**Depends on:** `schema.md` v1.5
 **Precedes:** `cloud-functions.md`, `firestore.rules`
 
 ---
@@ -39,14 +39,21 @@ A 🟢 update permission never means "any field on this document." Every such ro
 
 | Operation | Landlord | Tenant |
 |---|---|---|
-| Create | 🟢 (own `landlordId`) | — |
+| Create | 🟢 (own `landlordId`; valid required `upiId`, `upiQrImageUrl`, and `upiDisplayName`) | — |
 | Read (`get`, by ID) | 🟢 own | 🟢 only if a `joinRequests` or `leases` doc already links this tenant to the property (via `get()` cross-check) |
 | Read (`list`/query) | 🟢 `where('landlordId','==', uid)` | — (see discovery note) |
-| Update | 🟢 own, all fields except... | — |
+| Update | 🟢 own, allowed property fields; UPI configuration fields must be updated together and valid | — |
+| Read UPI configuration | — | 🟢 through the existing linked-property read; read-only |
 | Update `joinCode` | 🔒 (regenerating a code is a `resolveJoinCode`-adjacent concern; kept simple by disallowing client rewrite for now — reconsider if a "regenerate code" feature is added) | — |
 | Delete | — (never — use `status: 'archived'`) | — |
 
 **Property discovery (before any relationship exists):** a tenant entering a join code has no `joinRequests`/`leases` doc yet, so no rule can key off one. This is why discovery is 🔒 `resolveJoinCode()` (§ cloud-functions.md) rather than a Firestore query — it also prevents a client from running `where('joinCode','==', code)` against the whole collection, which would require a `list`-permitting rule that leaks every property's existence to any authenticated user.
+
+Property UPI configuration is writable only by the owning landlord. New
+properties require all three valid UPI fields. Existing properties without
+these fields remain readable and may be updated in other allowed fields; the
+owning landlord must configure all three together before tenants can use their
+payment information.
 
 ---
 
@@ -99,15 +106,23 @@ Both creation and termination are 🔒 because each must atomically touch `lease
 | Operation | Landlord | Tenant |
 |---|---|---|
 | Create (`draft`) | 🟢 own-property lease | — |
-| Update `lineItems`/`subtotal` while `status == 'draft'` | 🟢 own | — |
+| Update `lineItems`/`subtotal`/`total` while `status == 'draft'` | 🟢 own | — |
 | Read | 🟢 own-property | 🟢 own |
 | `draft` → `finalized` | 🔒 `finalizeRentCharge()` only | — |
 | Update `lateFineTotal`/`total` (via fine) | 🔒 `applyManualFine()` / scheduled auto-fine job only | — |
 | Update `adjustmentTotal`/`total` (via adjustment) | 🔒 `applyAdjustment()` only | — |
 | `finalized/due/overdue` → `payment_pending` | 🔒 (side effect of `payments` create — see §7) | — |
-| `payment_pending` → `paid`/`due`/`overdue` | 🔒 `verifyUpiPayment()` / `verifyGatewayPayment()` only | — |
+| `payment_pending` → `paid`/`due`/`overdue` | 🔒 `verifyUpiPayment()` only | — |
 | `due` → `overdue`, `finalized` → `due` | 🔒 scheduled job only | — |
 | Delete | — | — |
+
+Draft creation stores the billing-month due date (the 10th) and a provisional
+`total` equal to `subtotal`. Drafts allow at most 10 line items; Rules validate
+each item's exact shape, type, and integer-paise amount, the subtotal sum, and
+the provisional total. Draft edits may update `lineItems`, `subtotal`, and
+`total` together, but must still satisfy the same validation. Finalization
+revalidates the line items server-side and writes the authoritative totals and
+due date.
 
 ### 6.1 Subcollection `fineApplications`
 
@@ -132,16 +147,52 @@ Both paths are 🔒, not just the automatic one — a manual fine still has to u
 
 | Operation | Landlord | Tenant |
 |---|---|---|
-| Create | — | 🟢 own (`status` must be created as `pending_verification`; `verifiedAt`/`verifiedBy`/`rejectionReason` must be absent) |
+| Create UPI payment | 🔒 `createUpiPayment()` only | 🔒 `createUpiPayment()` only |
 | Read | 🟢 own-property | 🟢 own |
-| Update `status` → `verified`/`rejected` (method `upi_qr`) | 🔒 `verifyUpiPayment()` only | — |
-| Update `status` → `verified`/`failed` (method `gateway`) | — | 🔒 `verifyGatewayPayment()` only (server-initiated, no human actor) |
-| Update any other field | — | — |
+| Update `status` → `verified`/`rejected` (method `upi_qr`) | 🔒 `verifyUpiPayment()` only, owning landlord | — |
+| Update payment, proof, snapshots, or cleanup state | 🔒 backend only | 🔒 backend only |
 | Delete | — | — |
 
-Payment *creation* is 🟢 because it's a single isolated document with no side effects yet — the side effect (flipping `rentCharges.status` to `payment_pending`) is handled inside the same client-triggered flow as a Cloud Function call (`createUpiPayment()`/`createGatewayPayment()`, see `cloud-functions.md`) rather than a raw Firestore write, precisely so that step is also transactional. Verification is 🔒 for the reason established earlier in this thread: it must atomically update both the `payments` doc and the parent `rentCharges` doc, and — critically — a client "success" report must never be trusted for gateway payments.
+Payment creation is 🔒 even though a payment document is involved, because
+creating it must atomically consume a single-use upload intent, claim the UTR,
+and transition the bill to `payment_pending`. Firestore Rules deny direct
+client create, update, and delete for every role. The owning landlord's
+verification or rejection is performed by `verifyUpiPayment()` in a
+transaction; clients cannot directly set payment or bill state.
 
-**Important Note regarding Cloudinary:** The payment document remains fully protected by this authorization model. The tenant must not be able to arbitrarily create or modify payment records outside the approved payment Cloud Function flow. Do not weaken the existing Firestore authorization model just because the image is stored externally in Cloudinary.
+`verifyUpiPayment()` requires an authenticated landlord whose UID is the
+payment's `landlordId`. Before either decision, it must independently verify
+that `payment.rentChargeId` identifies the linked rent charge, the payment's
+tenant and landlord IDs match that bill, and the rent charge references the
+same tenant, landlord, lease, property, and unit as the payment. The lease
+must reference the same tenant, landlord, property, and unit; the property
+must belong to that landlord; and the unit must belong to that property and
+landlord with its `currentLeaseId` and status consistent with the linked
+lease under schema.md §§3 and 5 (ending a lease clears its `currentLeaseId`).
+Mismatched or missing linked records are rejected. Payment IDs copied
+into denormalized fields are not sufficient evidence of ownership.
+
+`paymentUploadIntents`, `rentCharges/{id}/upiReferences`, and
+`paymentProofCleanupOutbox` are server-only. The tenant receives a scoped
+10-minute upload token only after `preparePaymentProofUpload()` authorizes an
+eligible bill and validates the declared format and size against JPG, JPEG,
+PNG, or WebP and 5 MB (5,000,000 bytes). A server-mediated upload endpoint
+must enforce the token expiry before forwarding the upload to Cloudinary; the
+Cloudinary API secret and direct Cloudinary signature are never exposed to
+Flutter. The persisted intent expires after 15 minutes, independently of the
+upload token, and cannot be consumed after expiry. Cloudinary upload success
+does not create a payment or mark a bill paid. No cleanup task may delete
+proof referenced by a verified payment.
+
+`createUpiPayment()` requires a trimmed 6–30 character ASCII alphanumeric UTR;
+the trimmed submitted value is stored and its uppercase form is used for
+per-bill uniqueness. Only the owning landlord may approve or reject a payment
+through `verifyUpiPayment()`, using one of the frozen rejection reason codes.
+For the six predefined reasons, `rejectionExplanation` must be absent and a
+supplied value, including a blank string, is rejected. The `other` reason
+requires a trimmed 10–500 character explanation, which alone is retained and
+shown with the selected reason to the tenant. A rejection alone must not
+assign or imply a fraud label.
 
 ---
 
@@ -169,6 +220,15 @@ No cross-document consequences, so still entirely 🟢 — but hard delete is re
 
 Neither role should ever be able to write a notification claiming to be "for" another user, so creation is fully server-side.
 
+### Device tokens and delivery outbox
+
+`users/{uid}/deviceTokens/{tokenHash}` and
+`notificationDeliveries/{notificationId}` (including its `devices` subcollection)
+are server-only. Clients register or unregister only their own FCM token through
+authenticated `registerDeviceToken()` / `unregisterDeviceToken()` callables;
+Rules deny direct reads and writes to token and delivery records. Scheduled and
+delivery functions use Admin SDK transactions and writes.
+
 ---
 
 ## 10. Cloud-Function-only operations (summary)
@@ -185,29 +245,42 @@ Callable (user-triggered):
   finalizeRentCharge()
   applyManualFine()
   applyAdjustment()
-  preparePaymentProofUpload() (authorizes Cloudinary upload)
-  createUpiPayment()          (wraps payments.create + rentCharges → payment_pending)
-  verifyUpiPayment()
-  createGatewayPayment()
-  verifyGatewayPayment()
+  preparePaymentProofUpload() (creates tenant/bill-scoped upload intent)
+  createUpiPayment()          (consumes intent + claims UTR + bill → payment_pending)
+  verifyUpiPayment()          (owning landlord accepts/rejects)
 
 Scheduled:
   send25thLandlordReminder()
   send1stTenantNotifications()
   updateOverdueCharges()          (finalized → due → overdue)
   applyConfiguredLateFines()      (ruleSource: 'configured')
+  recoverPaymentProofCleanup()    (rejected/expired proof cleanup)
 ```
 
 ---
 
 ## 11. Notes carried forward from design discussion
 
-- `payment_pending` is a single status that must cover *both* payment methods — a gateway attempt in flight blocks adjustments exactly the same way a submitted UPI proof does (this generalization was confirmed during the adjustment-total discussion and applies here too).
+- `payment_pending` is the UPI state for a submitted proof awaiting landlord
+  review. UPI submission and owning-landlord approval/rejection are in scope
+  through the callable contracts. Gateway payment integration, gateway
+  verification, webhooks, and automated reconciliation remain deferred to
+  provider selection.
 - `cancelled` is deliberately **not** a `rentCharges` status yet — no confirmed product requirement (schema.md §12). If one emerges, it needs its own authorization row and function (`cancelRentCharge()`) designed before it's added anywhere.
 - **RESOLVED:** a tenant's other `pending` join requests auto-reject the moment one is accepted, as part of `acceptJoinRequest()`'s transaction (schema.md §4, cloud-functions.md §3). No longer an open item.
 - **RESOLVED:** `users` document creation and role assignment are both 🔒, handled atomically by `completeOnboarding()` (§1, cloud-functions.md §2) — this closes the role/custom-claim circularity (need a role to call a function that assigns a role) that existed in v1.0 of this document.
 
 ## 12. Changelog
+
+**v1.3** (approved UPI payment defaults):
+- Added upload format/size limits and independent 10-minute upload-permission and 15-minute intent expiries.
+- Added UTR format/length validation, reason-coded landlord rejection, and the required explanation and tenant-notification behavior for `other`.
+- Documented that rejected payments do not imply fraud and specified five-attempt cleanup behavior in schema.md.
+
+**v1.2** (UPI payment submission contract):
+- Changed payment creation from client-writable to callable-only; Rules deny all direct client payment writes.
+- Added server-only authorization for upload intents, per-bill UTR claims, and proof-cleanup outbox tasks.
+- Limited the active payment contract to UPI and the owning landlord's callable verification/rejection.
 
 **v1.1** (this revision, per architecture audit):
 - `users` document creation changed from 🟢 to 🔒 (`completeOnboarding()`) — closes the role/custom-claim circularity (§1).

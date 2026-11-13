@@ -1,9 +1,9 @@
 # Rently 2.0 — Cloud Function Contracts (Phase 2, Frozen)
 
 **Status:** Frozen for implementation
-**Version:** 1.1
-**Date:** 26 September 2026
-**Depends on:** `schema.md` v1.3, `authorization.md` v1.1
+**Version:** 1.4 — due/overdue-only UPI payment submission
+**Date:** 13 November 2026
+**Depends on:** `schema.md` v1.5, `authorization.md` v1.3
 **Next:** `firestore.rules`
 
 ---
@@ -175,7 +175,9 @@ Deliberately excludes `joinCode`, `landlordId`, and any other field — this is 
 - `rentCharges/{id}` exists, `status == 'draft'`, `landlordId == caller.uid`.
 - Parent `leases.status == 'active'`.
 - `billingMonth` matches the ID's month segment (defense-in-depth against a malformed draft).
+- `lineItems` contains at most 10 entries and exactly one `rent` entry; each item is validated server-side.
 - `subtotal` recomputed server-side from `lineItems` and must match the stored `subtotal` (catches any client-side arithmetic drift before it becomes historical fact).
+- Draft `total` matches `subtotal`, and its precomputed `dueDate` is the 10th of `billingMonth`.
 - No other `rentCharges` doc already exists for this `leaseId` + `billingMonth` — the composite ID (schema.md §6) makes this a single existence check, not a query.
 
 **Transaction steps:**
@@ -183,7 +185,7 @@ Deliberately excludes `joinCode`, `landlordId`, and any other field — this is 
 
 **Result:** `{ rentChargeId: string, dueDate: string, total: number }`
 
-**Errors:** `failed-precondition` (not draft, lease not active, or subtotal mismatch), `already-exists` (shouldn't be reachable given the composite ID, but checked defensively), `not-found`, `permission-denied`.
+**Errors:** `failed-precondition` (not draft, lease not active, invalid line items, or subtotal mismatch), `already-exists` (shouldn't be reachable given the composite ID, but checked defensively), `not-found`, `permission-denied`.
 
 **Idempotency:** safe — retrying after success hits `failed-precondition` (`status` no longer `draft`).
 
@@ -233,178 +235,402 @@ Deliberately excludes `joinCode`, `landlordId`, and any other field — this is 
 - No existing `adjustments` doc with this `idempotencyKey` (same pattern as `applyManualFine`, needed for the same reason).
 
 **Transaction steps:**
-1. Create `rentCharges/{id}/adjustments/{newAdjustmentId}`: `type: 'correction'`, `amount`, `reason`, `idempotencyKey`, `createdBy = caller.uid`.
+1. Create `rentCharges/{id}/adjustments/{idempotencyKey}`: `type: 'correction'`, `amount`, `reason`, `idempotencyKey`, `createdBy = caller.uid`.
 2. `rentCharges/{id}.adjustmentTotal += amount`, `total += amount`.
 
 **Result:** `{ adjustmentId: string, newAdjustmentTotal: number, newTotal: number }`
 
-**Errors:** `failed-precondition` (status not in the allowed set — the error message should distinguish "payment pending" from "already paid" so the landlord UI can explain *why*, per design.md's "don't hide financial info" rule), `already-exists` (duplicate `idempotencyKey` — returns the original adjustment's result rather than erroring, same retry-safety pattern as `applyManualFine()`), `invalid-argument`, `not-found`, `permission-denied`.
+**Errors:** `failed-precondition` (status not in the allowed set — the error message should distinguish "payment pending" from "already paid" so the landlord UI can explain *why*, per design.md's "don't hide financial info" rule), `already-exists` (the key was reused with a different payload), `invalid-argument`, `not-found`, `permission-denied`.
 
-**Idempotency:** via `idempotencyKey`, as above — this function's contract was already correct in v1.0; `applyManualFine()` has now been brought in line with it.
+**Idempotency:** `idempotencyKey` is a UUID, normalized to lowercase, and used as the adjustment document ID and persisted value. A retry with the same key and payload (including a case variant) does not write again; it returns the existing adjustment ID and the bill's current rollup totals. Reusing the key with a different payload returns `already-exists`.
 
 ---
 
 ## 9. `preparePaymentProofUpload`
 
 **Trigger:** callable
-**Auth:** `role == 'tenant'`, caller's `uid == rentCharges.tenantId`.
+**Auth:** authenticated `role == 'tenant'`; caller UID must own the
+`rentCharges/{rentChargeId}` document.
 
 **Input:**
 ```ts
-{ rentChargeId: string }
-```
-
-**Validation:**
-- `rentCharges/{id}` exists, `status ∈ {finalized, due, overdue}`, `tenantId == caller.uid`.
-
-**Transaction steps:**
-1. Cloud Function authenticates the caller and validates the tenant, lease, and rent charge states.
-2. Cloud Function generates a short-lived Cloudinary signed-upload authorization using the Cloudinary API secret. (The Cloudinary API secret must NEVER be sent to Flutter).
-3. The function returns only the required upload parameters to Flutter.
-
-**Result:**
-```ts
-{ 
-  cloudName: string, 
-  apiKey: string, 
-  timestamp: number, 
-  signature: string, 
-  resourceType: string, 
-  publicId?: string, 
-  folder?: string 
+{
+  rentChargeId: string,
+  idempotencyKey: string, // UUID
+  recipientNameConfirmed: true,
+  format: 'jpg' | 'jpeg' | 'png' | 'webp',
+  bytes: number // 1–5,000,000 inclusive
 }
 ```
 
-**Restrictions:** Payment proofs must be image resources only (JPEG/JPG, PNG, WebP), limited in size, uploaded into a Rently-specific Cloudinary folder/prefix, and associated with the intended payment/rent charge.
+**Validation:** bill exists, belongs to the caller, has status `due` or
+`overdue`, and its lease/property references are consistent. A `finalized`
+bill is not eligible until the scheduled transition changes it to `due`. The
+property must contain valid `upiId`, `upiQrImageUrl`, and `upiDisplayName`.
+Validate and normalize the UUID to lowercase before computing the intent
+document ID. The Flutter flow must require explicit recipient-name
+confirmation before calling this function; the acknowledgement is not proof
+that Rently verified recipient identity. Never accept a client-selected
+Cloudinary folder or `publicId`. Reject a missing/unsupported format or byte
+count outside 1–5,000,000 before issuing upload authorization. Normalize the
+declared format to lowercase and store it and the declared byte count in the
+intent; these client declarations are untrusted and must be checked against
+the uploaded file and Cloudinary metadata.
 
-**Errors:** `failed-precondition` (bill not in a payable state), `not-found`, `permission-denied`.
+**Intent and upload authorization:**
+1. In a Firestore transaction, re-read bill and scoped intent. Create
+   `paymentUploadIntents/{sha256(lowercase(idempotencyKey))}`
+   with tenant and bill IDs, a random `publicId`, fixed Rently folder,
+   `resourceType: 'image'`, declared format/bytes, `status: 'issued'`,
+   `createdAt = now`, and `expiresAt = now + 15 minutes`.
+2. A retry with the same scope/key and identical declared format/bytes reuses
+   the same unexpired issued intent. Reusing the key with a different scope or
+   declared file metadata, or reusing a consumed intent, returns
+   `already-exists`; an expired intent returns `failed-precondition`.
+3. Issue a scoped upload permission expiring at the earlier of `now + 10
+   minutes` and the persisted intent's `expiresAt`; persist its expiry as
+   `uploadPermissionExpiresAt`. On a retry, a renewed permission must not
+   extend the original intent's 15-minute expiry.
+4. The upload endpoint must reject requests after the permission expiry and
+   independently reject an expired, consumed, or non-`issued` intent. It must
+   enforce the 5 MB (5,000,000-byte) stream limit and approved image formats
+   from the actual uploaded content before forwarding the upload to
+   Cloudinary. Keep Cloudinary credentials server-side.
+5. Before calling Cloudinary, transactionally set a random `uploadClaimId` and
+   `uploadClaimExpiresAt = now + 7 minutes` on the intent. Reject a second
+   active claim. After Cloudinary returns, transactionally clear the matching
+   claim only if the intent remains `issued` and valid. If the intent became
+   invalid while the upload was in progress, change it to `cleanup_pending`
+   and enqueue the deterministic compensation task in the same transaction.
 
-**Idempotency:** safe to retry. Generates a new short-lived signature.
+**Cloudinary expiry constraint:** [Cloudinary's signature documentation](https://cloudinary.com/documentation/authentication_signatures)
+states that a standard timestamp-based signed upload remains valid for one
+hour. Therefore, never return a standard Cloudinary upload signature directly
+to Flutter. The 10-minute permission is enforced by the required
+server-mediated upload endpoint; only that endpoint uses Cloudinary
+authentication. The endpoint must validate the tenant's scoped token and its
+10-minute expiry before it forwards any file bytes to Cloudinary.
 
----
+**Result:**
+```ts
+{
+  success: true,
+  uploadIntentId: string,
+  uploadUrl: string, // Rently authenticated upload endpoint
+  uploadToken: string, // opaque, scoped, expires within 10 minutes
+  uploadPermissionExpiresAt: number, // Unix milliseconds
+  intentExpiresAt: number // Unix milliseconds, 15 minutes from intent creation
+}
+```
+
+`uploadPaymentProof` is an HTTPS endpoint called with the authenticated tenant
+session, `uploadIntentId`, a scoped bearer `uploadToken`, and the image stream.
+The token is bound to the tenant and intent and expires within 10 minutes. The
+endpoint independently checks the token expiry and intent status/15-minute
+expiry, enforces the declared and actual size/format, and uploads under the
+intent's fixed `publicId`/folder with overwrite disabled. It keeps all
+Cloudinary authentication server-side. The endpoint response only confirms
+upload completion; `createUpiPayment()` remains responsible for verifying
+Cloudinary metadata and atomically consuming the intent.
+
+Accept only JPEG/JPG, PNG, or WebP images of 1–5,000,000 bytes, uploaded to the
+fixed folder under an unguessable public ID with overwrite disabled. The
+upload endpoint validates the actual content and size before forwarding, and
+the backend independently verifies the Cloudinary asset metadata before
+submission. The upload permission expires after 10 minutes; the persisted
+intent expires after 15 minutes. Both expiries are independently enforced.
+Upload success alone never creates a payment or changes bill state. The
+permission may be replayed before its expiry, but the persisted intent can be
+consumed only once at submission.
+
+The handler checks `Content-Length` before accessing the runtime-provided
+`rawBody`, then checks the actual buffered byte count immediately. Firebase
+HTTPS request middleware may buffer the body before handler execution, so the
+handler cannot guarantee rejection before platform-level buffering; the
+header check avoids an additional application-level read/allocation, and the
+actual-byte check remains authoritative. Reject unsupported `Content-Type`
+values before reading `rawBody`, then verify the byte signature and structure
+independently of the declared MIME type.
+
+An upload claim lasts 7 minutes, longer than the HTTPS function's 120-second
+timeout. Expired-intent cleanup transactionally defers while the claim lease is
+active. If Cloudinary creates the asset after the intent has expired or become
+invalid, the upload transaction queues compensating deletion rather than
+marking the intent cleaned or returning a usable proof. Expired claims are
+reclaimable so crashed handlers cannot block cleanup indefinitely.
+
+**Errors:** `failed-precondition` (bill not payable, UPI details unavailable,
+or expired intent), `invalid-argument` (unsupported format or byte count),
+`not-found`, `permission-denied`,
+`already-exists` (idempotency key reused for another scope or consumed intent).
 
 ## 10. `createUpiPayment`
 
 **Trigger:** callable
-**Auth:** `role == 'tenant'`, caller's `uid == rentCharges.tenantId`.
+**Auth:** authenticated `role == 'tenant'`; caller UID must own the bill.
 
 **Input:**
 ```ts
-{ 
-  rentChargeId: string, 
-  proof: { provider: 'cloudinary', publicId: string, secureUrl: string, resourceType: string, uploadedAt: any }, 
-  transactionRef?: string 
+{
+  rentChargeId: string,
+  uploadIntentId: string,
+  idempotencyKey: string, // UUID; lowercase payment document ID
+  transactionRef: string
 }
 ```
 
 **Validation:**
-- `rentCharges/{id}` exists, `status ∈ {finalized, due, overdue}`, `tenantId == caller.uid`.
-- `proof` object is provided and contains Cloudinary metadata.
+- Bill, lease, and tenant ownership must agree; bill status is `due` or
+  `overdue`. A `finalized` bill is not eligible until its scheduled transition
+  changes it to `due`.
+- Validate and normalize the idempotency UUID to lowercase. Trim the required
+  UTR/reference; require 6–30 ASCII alphanumeric characters
+  (`^[A-Za-z0-9]{6,30}$`) after trimming. Preserve the trimmed submitted value
+  in payment history and use its uppercase form for the per-bill uniqueness
+  claim.
+- Intent exists, belongs to this tenant and bill, is `issued`, and is not
+  expired or consumed. Its 15-minute expiry must be valid at consumption.
+  Reject an intent with an unexpired `uploadClaimExpiresAt`; upload completion
+  must release its claim before payment submission can consume the intent.
+  Independently verify from Cloudinary asset metadata that the upload
+  completed while a valid 10-minute upload permission was in force.
+- Verify the Cloudinary asset server-side by intent public ID and fixed
+  folder: correct account, exact ID/folder, HTTPS secure URL, image resource
+  type, format matching the intent's declared JPG/JPEG/PNG/WebP value, and
+  actual size matching the declared byte count and not exceeding 5,000,000
+  bytes. Verify the Cloudinary upload timestamp is no later than the issued
+  upload permission's expiry. Ignore client-provided proof metadata.
+- Validate bill financial rollups as safe integer paise and require
+  `total == subtotal + lateFineTotal + adjustmentTotal`.
 
 **Transaction steps:**
-1. Create `payments/{newPaymentId}`: `rentChargeId`, denormalized `leaseId`/`tenantId`/`landlordId`/`propertyId`/`unitId`, `method: 'upi_qr'`, `amountDue = rentCharges.total`, `gatewayFee: 0`, `totalPaid = amountDue`, `status: 'pending_verification'`, `proof`, `transactionRef`, `submittedAt = now`.
-2. `rentCharges/{id}.status = 'payment_pending'`.
+1. Check `payments/{idempotencyKey}` before requiring the Cloudinary asset. If
+   it exists, return it only when tenant, bill, UTR, and intent match;
+   otherwise reject key reuse. This makes retries work even if later cleanup
+   has removed an already-submitted asset.
+2. Verify the Cloudinary asset before entering the Firestore transaction.
+3. In the transaction check `payments/{idempotencyKey}` again to handle
+   concurrent retries. Return the matching record or reject key reuse.
+4. Re-read bill and intent, require an eligible bill, an unexpired 15-minute
+   intent, a matching `issued` intent, and no active upload claim. Verify from
+   Cloudinary metadata that the upload completed before the 10-minute
+   permission expired, and
+   verify that
+   `rentCharges/{rentChargeId}/upiReferences/{SHA256(uppercase(trimmed UTR))}`
+   does not already exist.
+5. Create `payments/{idempotencyKey}` with server-derived denormalized IDs,
+   `method: 'upi_qr'`, `amountDue = rentCharges.total`, `gatewayFee = 0`,
+   `totalPaid = amountDue`, `status: 'pending_verification'`, verified proof
+   metadata, required `transactionRef`, `upiIdSnapshot`,
+   `upiDisplayNameSnapshot`, and server timestamps. Initialize
+   `proofCleanup.status = 'not_requested'`.
+6. In that transaction consume the intent, set `consumedByPaymentId`, create
+   the UTR claim, and set bill status to `payment_pending`.
+7. Create a deterministic `payment_proof_submitted` notification for the
+   owning landlord, related to this payment. Do not include proof URL or full
+   UTR in push text.
 
-**Result:** `{ paymentId: string }`
+**Result:** `{ success: true, paymentId: string, status: 'pending_verification' }`
 
-**Errors:** `failed-precondition` (bill not in a payable state — already `payment_pending` or `paid`), `not-found`, `permission-denied`.
+**Errors:** `failed-precondition` (bill not payable, intent invalid/expired,
+or proof invalid), `invalid-argument` (UUID or UTR invalid),
+`already-exists` (key or UTR already claimed), `not-found`,
+`permission-denied`.
 
-**Idempotency:** a bill already at `payment_pending` fails fast rather than creating a second competing payment for the same charge.
+**Idempotency:** same key and same tenant/bill/UTR/intent returns the existing
+payment without another write. Same key with different values is rejected.
+Different keys race on the bill transaction; only one transitions an eligible
+bill to `payment_pending`. After rejection, a new attempt requires a new key,
+intent, and UTR. Never overwrite prior attempts. A failed submission leaves
+the bill unchanged and intent unconsumed.
 
----
+The Flutter flow must require tenant confirmation that the displayed
+recipient name matches their UPI app before initiating upload and before
+enabling submission. This is a user acknowledgement, not independent
+verification by Rently.
 
 ## 11. `verifyUpiPayment`
 
 **Trigger:** callable
-**Auth:** `role == 'landlord'`, caller's `uid == payments.landlordId`.
+**Auth:** authenticated `role == 'landlord'`; caller UID must equal the
+payment's `landlordId`.
 
 **Input:**
 ```ts
-{ paymentId: string, decision: 'accept' | 'reject', rejectionReason?: string }
+{
+  paymentId: string,
+  decision: 'accept' | 'reject',
+  rejectionReasonCode?: 'old_or_used_screenshot'
+    | 'blurry_or_unreadable_screenshot'
+    | 'incomplete_amount'
+    | 'incorrect_utr'
+    | 'payment_not_received'
+    | 'screenshot_bill_mismatch'
+    | 'other',
+  rejectionExplanation?: string
+}
 ```
 
-**Validation:**
-- `payments/{id}` exists, `method == 'upi_qr'`, `status == 'pending_verification'`, `landlordId == caller.uid`.
-- If `decision == 'reject'`, `rejectionReason` required.
+Require payment method `upi_qr`, status `pending_verification`, and a linked
+bill in `payment_pending`. Independently validate the complete linked-record
+relationship before either decision:
 
-**Transaction steps (accept):**
-1. `payments/{id}.status = 'verified'`, `verifiedAt = now`, `verifiedBy = caller.uid`.
-2. `rentCharges/{payments.rentChargeId}.status = 'paid'`, `paidAt = now`.
+- The payment's `rentChargeId` identifies the linked rent charge, its tenant
+  and landlord IDs match that bill.
+- The rent charge references the same tenant, landlord, lease, property, and
+  unit as the payment.
+- The lease references the same tenant, landlord, property, and unit.
+- The property belongs to the same landlord.
+- The unit belongs to the same property and landlord, and its current lease
+  relationship and status are consistent with the linked lease under
+  schema.md §§3 and 5 (ending a lease clears its `currentLeaseId`).
+- The authenticated caller UID matches the payment's landlord ID.
 
-**Transaction steps (reject):**
-1. `payments/{id}.status = 'rejected'`, `verifiedAt = now`, `verifiedBy = caller.uid`, `rejectionReason`.
-2. `rentCharges/{payments.rentChargeId}.status` reverts to `due` or `overdue` — whichever it would naturally be given `dueDate` vs. today's date, recomputed at this moment (not just "whatever it was before `payment_pending`," in case time passed while the proof sat in review).
+Reject missing or inconsistent linked records; do not rely only on IDs copied
+into the payment document.
 
-**Result:** `{ paymentId: string, decision: string, rentChargeStatus: string }`
+Rejection requires one `rejectionReasonCode` from the listed choices. Persist
+the selected code and its exact canonical display label: “Old or previously
+used screenshot”, “Blurry or unreadable screenshot”, “Payment amount is
+incomplete”, “Incorrect UTR/reference number”, “Payment not received in
+landlord's account”, “Screenshot does not match this rent bill”, or “Other”.
+For the six predefined reasons, `rejectionExplanation` must be absent; reject
+the request if it is supplied, including as a blank string. For `other`, require
+a trimmed `rejectionExplanation` of 10–500 characters. Persist the explanation
+only for `other`. Do not accept an arbitrary reason for the predefined codes.
 
-**Errors:** `failed-precondition` (wrong method or already resolved), `invalid-argument` (missing rejection reason), `not-found`, `permission-denied`.
+For `accept`, reject any rejection code or explanation in the input.
 
-**Idempotency:** safe — a payment no longer `pending_verification` fails fast on retry.
+**Accept transaction:** atomically set payment status to `verified`,
+`reviewedAt = now`, `reviewedBy = caller.uid`, and `proofCleanup.status =
+retained`; set bill status to `paid` and `paidAt = now`; create a deterministic
+`payment_accepted` notification for the tenant. Proof remains in Cloudinary
+and is never queued for deletion.
+
+**Reject transaction:** atomically set payment status to `rejected`,
+`reviewedAt`, `reviewedBy`, `rejectionReasonCode`, and canonical
+`rejectionReason`; for `other`, also set `rejectionExplanation`; set
+`proofCleanup.status = pending` and `proofCleanup.requestedAt = now`; restore
+bill status to `overdue` only when `dueDate` is earlier than the current UTC
+date (`YYYY-MM-DD`), otherwise `due`; enqueue a deterministic
+`paymentProofCleanupOutbox` task;
+and create a deterministic `payment_rejected` notification for the tenant.
+Notification body includes the selected rejection reason and, for `other`, its
+explanation; it explains a new attempt may be submitted. The payment and proof
+metadata remain in Firestore. A rejected payment does not automatically label
+the tenant fraudulent.
+
+**Result:** `{ success: true, paymentId: string, decision: 'accept' | 'reject', rentChargeStatus: 'paid' | 'due' | 'overdue' }`
+
+**Errors:** `failed-precondition` (wrong method, resolved payment, or
+bill/payment mismatch), `invalid-argument` (missing/unknown rejection code,
+explanation supplied for a predefined reason, or missing/invalid `other`
+explanation),
+`not-found`, `permission-denied`.
+
+**Idempotency:** retrying the same decision after commit returns the committed
+result without duplicating notifications or cleanup tasks. A conflicting
+decision after resolution fails.
+
+## 12. Payment proof cleanup and expired upload recovery
+
+**Trigger:** server-only outbox workers and scheduled recovery; no client
+callable.
+
+`recoverPaymentProofCleanup` periodically scans due outbox tasks and expired,
+unconsumed intents. Rejected proofs and expired, unconsumed intents enqueue
+deterministic `paymentProofCleanupOutbox` tasks (`paymentId` for a rejected
+proof; `uploadIntentId` for an abandoned upload). Each task has exactly one
+source record. For a rejected-payment task, `paymentId` must identify the
+rejected payment and `publicId` must exactly match its immutable
+`proof.publicId`; the worker verifies this binding before deletion. The worker
+also checks that no verified payment references that proof. In one transaction,
+cleanup changes an expired `issued` intent to `cleanup_pending` and creates its
+task, unless an unexpired upload claim exists; active claims defer cleanup. A
+late upload transactionally creates or requeues its deterministic compensation
+task. A consumed intent is never eligible.
+Initialize each task with `attempts: 0`, `manualRetryCount: 0`, and
+`errorHistory: []`.
+Use transactional claim leases and exponential backoff
+(`baseDelay × 2^(attempts - 1)`); permit at most five failed deletion attempts
+per automatic retry cycle. A failure on attempt five, including a reclaimed
+task whose attempts are already exhausted, sets the task and linked cleanup
+state to `terminal_failure` in the same transaction. Preserve the task,
+`lastError`, and append-only `errorHistory` for administrative/manual retry;
+manual requeue resets only the current-cycle `attempts`, increments
+`manualRetryCount`, and retains prior errors. Treat an already-absent asset as
+successful deletion, not a failed attempt. Delete only the recorded public ID
+under the fixed folder using Cloudinary credentials from Secret Manager.
+Re-check immediately before deletion that no verified payment references the
+asset.
+
+On success, mark the task completed and payment cleanup `deleted` or intent
+`cleaned`. Transient failures append error details and set the next attempt.
+A submission racing cleanup must transactionally
+consume the intent before cleanup claims it; only one path wins.
+Deploy indexes for cleanup tasks `(status, nextAttemptAt)` and
+`(status, claimExpiresAt)`, plus expired issued intents `(status, expiresAt)`.
 
 ---
 
-## 12. `createGatewayPayment`
-
-**Trigger:** callable
-**Auth:** `role == 'tenant'`, caller's `uid == rentCharges.tenantId`.
-
-**Input:**
-```ts
-{ rentChargeId: string }
-```
-
-**Validation:**
-- `rentCharges/{id}` exists, `status ∈ {finalized, due, overdue}`, `tenantId == caller.uid`.
-- **Provider integration itself is out of scope until Phase 7 / provider selection (PRD §20)** — this contract defines the Firestore-side shape only; the actual `gatewayFee` calculation and provider order/session creation are provider-specific and deliberately left unspecified here.
-
-**Transaction steps:**
-1. Create `payments/{newPaymentId}`: `method: 'gateway'`, `amountDue = rentCharges.total`, `gatewayFee` (from provider, TBD), `totalPaid = amountDue + gatewayFee`, `status: 'pending_verification'`, `submittedAt = now`.
-2. `rentCharges/{id}.status = 'payment_pending'`.
-3. Return whatever session/order identifier the (TBD) provider requires the client to continue the payment flow.
-
-**Result:** `{ paymentId: string, providerSessionData: object /* shape TBD per provider */ }`
-
-**Errors:** same pattern as `createUpiPayment`.
-
-**Idempotency:** same pattern as `createUpiPayment`.
-
-**Status:** placeholder contract — do not implement against a specific provider until Phase 7 explicitly selects one.
-
----
-
-## 13. `verifyGatewayPayment`
-
-**Trigger:** **HTTPS webhook**, not a callable — invoked by the payment provider's server, not the Rently client. Authenticated via the provider's webhook signature verification, **not** Firebase Auth (`context.auth` will be absent; do not check it).
-
-**Input:** provider-specific webhook payload (shape TBD per provider, Phase 7).
-
-**Validation:**
-- Verify the webhook signature against the provider's secret before trusting any payload content — this is the entire point of this function existing separately from a client call (architecture.md §11: a client "success" report is never sufficient).
-- Resolve the corresponding `payments` doc via the provider's transaction/order reference stored in `transactionRef`.
-
-**Transaction steps:** identical shape to `verifyUpiPayment`'s accept path, driven by the provider's reported outcome instead of a landlord tap: `payments.status = 'verified' | 'failed'`, and on success `rentCharges.status = 'paid'`, `paidAt = now`.
-
-**Result:** HTTP 200 acknowledgment to the provider (providers typically retry on non-200).
-
-**Errors:** signature verification failure → reject the webhook (do not process); unknown `transactionRef` → log and reject.
-
-**Idempotency:** webhook providers commonly retry — the function must check `payments.status` before applying the transition, so a duplicate webhook delivery for an already-`verified` payment is a no-op, not a double-write.
-
-**Status:** placeholder contract, same caveat as `createGatewayPayment`.
-
----
-
-## 14. Scheduled functions
+## 13. Scheduled functions
 
 ### `send25thLandlordReminder`
-**Trigger:** scheduled, monthly on the 25th.
-**Logic:** for every `leases` with `status == 'active'`, create a `notifications` doc for the landlord (`type: 'prepare_bill_reminder'`). No Firestore writes outside `notifications` — this never touches `rentCharges` (architecture.md §8: no bill is auto-generated here).
-**Idempotency:** guard against double-firing (e.g. a retried Cloud Scheduler invocation) by keying the notification's existence check on `recipientId + type + billingMonth` before creating a duplicate.
+**Trigger:** scheduled, monthly on the 25th at 09:00 UTC.
+**Logic:** group active leases by landlord and create one `notifications` doc for each landlord (`type: 'prepare_bill_reminder'`) for the following UTC billing month. It also creates a server-only delivery outbox record. The notification ID is a deterministic hash of `recipientId + type + upcoming billingMonth`; no `billingMonth` field is added to the notification. This function never reads or writes `rentCharges` (architecture.md §8: no bill is auto-generated here).
+**Idempotency:** the notification and outbox record are created in a Firestore transaction. A retried or overlapping scheduler invocation sees the deterministic notification ID and does not create another reminder.
 
 ### `send1stTenantNotifications`
-**Trigger:** scheduled, monthly on the 1st.
-**Logic:** for every `rentCharges` with `status == 'finalized'` and `billingMonth` == the current month, transition `status → 'due'` and create a `notifications` doc for the tenant (`type: 'rent_due'`).
-**Idempotency:** same pattern — check `rentCharges.status` before transitioning; a re-run skips anything no longer `finalized`.
+**Trigger:** scheduled, monthly on the 1st at 09:00 UTC.
+**Logic:** for every `rentCharges` with `status == 'finalized'` and `billingMonth` equal to the current UTC month, atomically transition `status → 'due'` and create a `notifications` doc for the tenant (`type: 'rent_due'`) plus a delivery outbox record. Notification IDs are deterministic hashes of the rent-charge document ID.
+**Idempotency:** the transaction re-reads the bill and only transitions a still-finalized current-month bill. A retry or overlapping invocation skips bills already transitioned.
+
+### FCM delivery and token lifecycle
+
+`registerDeviceToken()` and `unregisterDeviceToken()` are authenticated,
+user-scoped callables. Tokens are stored in the user's `deviceTokens`
+subcollection under a SHA-256 token ID; clients cannot read or write that
+subcollection directly. Calls include the expected UID, which the server
+compares with the authenticated UID to reject account-switch races. Flutter
+stores the UID/token ownership pair in platform secure storage. It persists
+pending removals before attempting cleanup, unregisters only while the matching
+UID is authenticated, and retries pending cleanup on that user's next sign-in.
+Sign-out is not blocked indefinitely: the cleanup call has a short timeout and
+the durable local retry state is retained on failure. A token pending removal
+for one UID is not registered to another UID.
+
+Creation of a delivery outbox record fans out per-device tasks. A Firestore
+create trigger sends each push using Firebase Admin Messaging. A transaction
+claims each device task for five minutes. Confirmed invalid tokens are removed
+atomically with the terminal delivery state, from only the recipient's
+user-scoped token path.
+
+Transient FCM failures are persisted as `pending` with exponential delays
+starting at one minute, doubling per attempt and capped at six hours. At most
+five send attempts are made. Known permanent FCM errors and exhausted retries
+are recorded as terminal `failed` tasks with error details; confirmed invalid
+tokens use terminal `invalid`. A UTC worker runs every five minutes, retrying
+due tasks and reclaiming expired `sending` leases using the same transactional
+claim. The `devices` collection-group indexes for `(status, nextAttemptAt)` and
+`(status, leaseExpiresAt)` must be deployed with the functions.
+
+Delivery is at-least-once, not exactly-once. If FCM accepts a push but its
+acknowledgment is lost, or the worker crashes before persisting `sent`, a later
+retry can send a duplicate. The Firestore notification document remains the
+durable source of truth.
+
+Android uses the existing Firebase app configuration. iOS is not configured in
+this repository: add `ios/Runner/GoogleService-Info.plist` generated for the
+Runner target's actual bundle identifier, rerun FlutterFire configuration with
+the real iOS Firebase options, enable the Push Notifications and Background
+Modes capabilities in Xcode, and configure an APNs authentication key in
+Firebase Console before claiming iOS push support. Until then, startup displays
+a configuration-required screen instead of initializing Firebase with
+fabricated values. Web builds require the Firebase Messaging service worker and
+a Web Push VAPID key supplied as
+`--dart-define=FCM_WEB_VAPID_KEY=<public-web-push-key>`. The web key is not a
+service-account credential. Do not enable web push until the service worker,
+VAPID key, and authorized hosting origin are configured.
 
 ### `updateOverdueCharges`
 **Trigger:** scheduled, daily.
@@ -418,7 +644,7 @@ Deliberately excludes `joinCode`, `landlordId`, and any other field — this is 
 
 ---
 
-## 15. Summary table
+## 14. Summary table
 
 | Function | Trigger | Actor |
 |---|---|---|
@@ -431,21 +657,67 @@ Deliberately excludes `joinCode`, `landlordId`, and any other field — this is 
 | applyManualFine | callable | landlord |
 | applyAdjustment | callable | landlord |
 | preparePaymentProofUpload | callable | tenant |
+| uploadPaymentProof | HTTPS upload endpoint | tenant with valid scoped upload token |
 | createUpiPayment | callable | tenant |
 | verifyUpiPayment | callable | landlord |
-| createGatewayPayment | callable | tenant |
-| verifyGatewayPayment | webhook | provider |
+| recoverPaymentProofCleanup | scheduled/outbox worker | — |
 | send25thLandlordReminder | scheduled | — |
 | send1stTenantNotifications | scheduled | — |
 | updateOverdueCharges | scheduled | — |
 | applyConfiguredLateFines | scheduled | — |
 
-## 16. Open items carried into implementation
-
-Two of the three items from v1.0 are now resolved:
+## 15. Open items carried into implementation
 
 1. ~~Auto-reject of a tenant's other pending `joinRequests` on acceptance~~ — **RESOLVED**, see `acceptJoinRequest()` §4 step 5.
 2. ~~`applyManualFine`/`applyAdjustment` idempotency contract~~ — **RESOLVED**, both now require `idempotencyKey` in their input contracts (§7, §8). The client-side UUID generation convention (which library, where it's called from) still needs to be agreed with whoever builds the Flutter forms — a minor implementation detail, not an open design question.
-3. Gateway contracts (§12, §13) remain placeholders pending provider selection — correctly still open per PRD §20, do not implement early.
+3. Landlord approval and rejection of UPI QR payments are in scope through
+   `verifyUpiPayment()` (§11). Gateway payment integration, gateway
+   verification, webhooks, and automated gateway reconciliation remain
+   deferred. Provider selection remains deferred to Phase 7 per PRD §20.
+4. The proof defaults are resolved: JPG/JPEG/PNG/WebP, 5 MB maximum, a
+   10-minute upload permission, and a 15-minute persisted intent. Configure
+   the fixed Cloudinary folder and cleanup worker cadence.
+5. Cleanup is limited to five failed attempts per automatic retry cycle with
+   exponential backoff; set the base delay and define the administrative
+   requeue procedure. Cleanup uses its own outbox, not the notification
+   delivery records.
+6. UTR is resolved to a trimmed 6–30 character ASCII alphanumeric value,
+   unique case-insensitively per bill. Rejection reasons use the fixed enum;
+   `other` requires a 10–500 character explanation.
+7. Cloudinary's standard signed-upload signature lasts one hour, so the
+   server-mediated `uploadPaymentProof` endpoint is mandatory to enforce the
+   10-minute permission. Never send that standard signature to Flutter.
 
-No design-level open items remain. Item 3 is an intentional scope deferral, not an oversight.
+These are implementation/configuration decisions, not permission to weaken
+authorization, extend the signature scope, or accept unverified Cloudinary
+metadata.
+
+## 16. Required implementation tests
+
+- Callable role, authentication, and ownership tests: unauthenticated callers,
+  wrong roles, another tenant's bill/intent, another landlord's payment, and
+  missing or inconsistent tenant/bill/lease/property/unit relationships.
+- Submission integrity tests: missing/invalid UTR, 6/30-character boundaries,
+  out-of-range and non-alphanumeric UTRs, invalid or expired upload permission
+  and intent independently, wrong Cloudinary account/public ID/folder,
+  non-HTTPS URL, each accepted/rejected format, sizes at 1 byte and 5,000,000
+  bytes and above 5,000,000 bytes, declared-vs-actual metadata mismatch,
+  malformed proof metadata,
+  invalid paise totals, and immutable UPI snapshots.
+- Transaction/concurrency tests: payment and bill transition commit together
+  or neither; duplicate UTR claims; same-key identical retry; same-key
+  different-payload rejection; concurrent distinct submissions; and new
+  payment/UTR after rejection without overwriting history.
+- Verification tests: owning landlord accept/reject, foreign landlord denied,
+  each predefined rejection reason, explanation rejected for predefined
+  reasons even when blank, trimmed `other` explanation required within
+  10–500 characters, duplicate decision idempotency,
+  due-versus-overdue restoration at the UTC date boundary, notification emitted
+  once with the selected reason and explanation, and no fraud label.
+- Cleanup tests: expired unused upload deletion, rejected proof deletion,
+  exponential retry timing, exactly five failed attempts before terminal
+  failure, preserved error history across manual retry, concurrent claims,
+  already-absent asset handling, and verified proof never deleted.
+- Rules tests: direct client payment create/update/delete denied for all roles;
+  direct access to upload intents, UTR claims, and cleanup tasks denied; only
+  existing tenant/owning-landlord payment reads allowed.

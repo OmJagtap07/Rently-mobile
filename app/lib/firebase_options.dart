@@ -14,8 +14,10 @@ class DefaultFirebaseOptions {
         return android;
       case TargetPlatform.iOS:
         throw UnsupportedError(
-          'DefaultFirebaseOptions have not been configured for ios - '
-          'you can reconfigure this by running the FlutterFire CLI again.',
+          'iOS Firebase is not configured. Add the real '
+          'ios/Runner/GoogleService-Info.plist and rerun FlutterFire '
+          'configuration using the iOS app registration and values from '
+          'Firebase Console; do not copy Android credentials.',
         );
       case TargetPlatform.macOS:
         throw UnsupportedError(

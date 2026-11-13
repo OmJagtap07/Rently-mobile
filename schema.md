@@ -1,8 +1,8 @@
 # Rently 2.0 — Firestore Schema (Phase 1, Frozen)
 
 **Status:** Frozen for implementation
-**Version:** 1.3 — revised per architecture audit (see changelog, §12)
-**Date:** 26 September 2026
+**Version:** 1.5 — approved UPI payment defaults and upload lifecycle claims
+**Date:** 12 November 2026
 **Scope:** New Firebase project. Does not migrate the existing `transactions`/`tenants` collections from the current web app (see Phase 0 audit — those collections lack the relational structure needed here).
 
 ---
@@ -50,6 +50,9 @@
 | name | string | yes | |
 | address | string | yes | |
 | googleMapsLink | string | no | |
+| upiId | string | yes | Property-specific UPI VPA, validated against the supported `name@handle` format. |
+| upiQrImageUrl | string | yes | HTTPS URL of the property's UPI QR image. |
+| upiDisplayName | string | yes | Configured recipient name tenants compare with the name shown in their UPI app; Rently does not independently verify identity. |
 | joinCode | string | yes | unique, tenant-facing code used to find/apply to this property |
 | status | enum: `active` \| `archived` | yes | soft-delete only |
 | lateFineConfig | map, see §6 | no | property-level default; a lease may override |
@@ -153,7 +156,7 @@ Using a deterministic ID instead of an auto-ID prevents a landlord from accident
 | adjustmentTotal | integer (paise) | yes | sum of applied adjustments, can be negative (see §6.3); defaults to 0; updated only by `applyAdjustment()` |
 | total | integer (paise) | yes | **`subtotal + lateFineTotal + adjustmentTotal`** — the current amount payable. Recomputed transactionally by whichever function (`applyManualFine()`, the auto-fine job, or `applyAdjustment()`) touches `lateFineTotal` or `adjustmentTotal`; never written directly by a client. |
 | status | enum: `draft` \| `finalized` \| `due` \| `overdue` \| `payment_pending` \| `paid` | yes | see transition table below |
-| dueDate | string `YYYY-MM-DD` | yes | set at finalize (10th of billing month per PRD §9) |
+| dueDate | string `YYYY-MM-DD` | yes | precomputed on the draft as the 10th of the billing month; revalidated and written again at finalization (per PRD §9) |
 | finalizedAt / finalizedBy | Timestamp / string | no | set once, then immutable |
 | paidAt | Timestamp | no | |
 | createdAt / updatedAt | Timestamp | yes | |
@@ -167,17 +170,16 @@ draft ──finalize──▶ finalized ──(dueDate reached)──▶ due ─
                                                                   ▼
                                                           payment_pending
                                                                   ▼
-                                                     (landlord accepts proof, or
-                                                      gateway server-verifies)
+                                                     (owning landlord accepts)
                                                                   ▼
                                                                 paid
 ```
 
 - `draft` → `finalized`: 🔒 `finalizeRentCharge()` only — not a direct field edit. The function validates lease is active, landlord owns it, billing month is valid, `subtotal` matches `lineItems`, and no charge already exists for that lease/month (the composite ID makes this last check nearly free) before locking `lineItems`/`subtotal`.
 - `finalized`/`due`/`overdue` → `lineItems`/`subtotal` are permanently locked. `lateFineTotal`/`adjustmentTotal`/`total` can still move, but only via 🔒 `applyManualFine()` / the scheduled auto-fine job / `applyAdjustment()` — never a direct field write. This satisfies the "no silent rewrite of finalized bills" rule while still allowing the *current amount due* to change.
-- **`applyAdjustment()` is only callable while status is `finalized`, `due`, or `overdue`.** It is blocked once a bill reaches `payment_pending` (a payment attempt — UPI proof submitted, or a gateway attempt initiated — represents a claim against a specific total, which must not shift underneath it) and blocked at `paid` (use a future refund/credit mechanism instead, never rewrite a paid bill's history). `draft` doesn't need adjustments — just edit the draft directly.
+- **`applyAdjustment()` is only callable while status is `finalized`, `due`, or `overdue`.** It is blocked once a UPI proof is submitted and the bill reaches `payment_pending` (the payment attempt claims a specific total, which must not shift underneath it) and blocked at `paid` (use a future refund/credit mechanism instead, never rewrite a paid bill's history). `draft` doesn't need adjustments — just edit the draft directly.
 - `due` → `overdue` and `finalized` → `due`: transitioned by scheduled backend job (Phase 10), not the client.
-- `payment_pending` → `paid` or back to `overdue`/`due` (on rejection) is driven by 🔒 `verifyUpiPayment()` / `verifyGatewayPayment()` (§7), not set directly by the client.
+- `payment_pending` → `paid` or back to `overdue`/`due` (on rejection) is driven by 🔒 `verifyUpiPayment()` (§7), not set directly by the client.
 
 ### 6.2 Subcollection: `rentCharges/{id}/fineApplications/{fineId}`
 
@@ -231,31 +233,151 @@ total               ₹12,100   ← current amount payable
 
 ## 7. `payments`
 
-**Document ID:** auto-generated
+**Document ID:** lowercase client-generated UUID `idempotencyKey`. A retry
+with the same key addresses the same payment; each new attempt uses a new key
+and creates a new immutable history record.
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | rentChargeId | string (ref → rentCharges) | yes | |
-| leaseId, tenantId, landlordId, propertyId, unitId | string | yes | denormalized |
-| method | enum: `gateway` \| `upi_qr` | yes | |
-| amountDue | integer (paise) | yes | the rent-charge amount owed, excluding any gateway fee — always equals the `rentCharges.total` at time of payment |
-| gatewayFee | integer (paise) | yes | **0 for `upi_qr`**, provider fee for `gateway`; shown to tenant before confirmation per design.md §7 |
-| totalPaid | integer (paise) | yes | `amountDue + gatewayFee` — the actual amount that left the tenant's account. Stored explicitly (not left to be re-derived) so reports never need to reconstruct it. |
-| status | enum: `pending_verification` \| `verified` \| `rejected` \| `failed` | yes | |
-| proof | map | no | **UPI only** — Cloudinary reference: `{ provider: "cloudinary", publicId: "...", secureUrl: "...", resourceType: "image", uploadedAt: Timestamp }` |
-| transactionRef | string | no | gateway transaction ID or UPI reference number |
-| submittedAt | Timestamp | yes | |
-| verifiedAt | Timestamp | no | |
-| verifiedBy | string (ref → users) | no | landlord for UPI; `"system"` for gateway server-side verification |
-| rejectionReason | string | no | required if `status == rejected` |
+| leaseId, tenantId, landlordId, propertyId, unitId | string | yes | denormalized from the bill/lease |
+| method | enum: `upi_qr` | yes | Payment gateway is out of scope. |
+| amountDue | integer (paise) | yes | Server-derived from `rentCharges.total` at submission. |
+| gatewayFee | integer (paise) | yes | Always `0` for this UPI-only contract. |
+| totalPaid | integer (paise) | yes | Equals `amountDue`; tenant-reported and not proof of settlement. |
+| status | enum: `pending_verification` \| `verified` \| `rejected` | yes | Initial status is `pending_verification`. |
+| proof | map | yes | Immutable Cloudinary metadata: `{ provider: "cloudinary", publicId: string, secureUrl: HTTPS string, resourceType: "image", format: "jpg" \| "jpeg" \| "png" \| "webp", bytes: integer, uploadedAt: Timestamp }`. The backend verifies it against the intent and Cloudinary asset. Formats are case-normalized to lowercase; `bytes` must be 1–5,000,000 (5 MB). |
+| transactionRef | string | yes | Required UTR/reference. Store the trimmed submitted value; it must contain 6–30 ASCII alphanumeric characters and is unique per bill after uppercase normalization. |
+| upiIdSnapshot | string | yes | Immutable property UPI ID at submission time. |
+| upiDisplayNameSnapshot | string | yes | Immutable configured recipient name at submission time. Rently does not independently verify identity. |
+| idempotencyKey | string (UUID) | yes | Client-generated UUID and payment document ID; reused only to retry the same submission. |
+| submittedAt | Timestamp | yes | Server timestamp. |
+| reviewedAt | Timestamp | no | Server timestamp set on approval or rejection. |
+| reviewedBy | string (ref → users) | no | Owning landlord who approved or rejected. |
+| rejectionReasonCode | enum | no | Required when `status == rejected`: `old_or_used_screenshot`, `blurry_or_unreadable_screenshot`, `incomplete_amount`, `incorrect_utr`, `payment_not_received`, `screenshot_bill_mismatch`, or `other`. Their exact labels are respectively “Old or previously used screenshot”, “Blurry or unreadable screenshot”, “Payment amount is incomplete”, “Incorrect UTR/reference number”, “Payment not received in landlord's account”, “Screenshot does not match this rent bill”, and “Other”. |
+| rejectionReason | string | no | Required when rejected; exact canonical label corresponding to `rejectionReasonCode`. |
+| rejectionExplanation | string | no | Required only when `rejectionReasonCode == 'other'`; landlord's trimmed explanation must be 10–500 characters. For the six predefined reasons it must be absent; reject a supplied value, including a blank string. |
+| proofCleanup | map | yes | `{ status: "not_requested" \| "retained" \| "pending" \| "processing" \| "deleted" \| "terminal_failure", requestedAt?: Timestamp, completedAt?: Timestamp }`. New payments start `not_requested`; approval sets `retained`; rejection sets `pending` and queues cleanup. |
 | createdAt / updatedAt | Timestamp | yes | |
 
-**Critical rule (architecture.md §11):** `status: 'verified'` must never be set from a client-reported "success" alone.
-- UPI path: only a landlord action (`verifiedBy` = a landlord UID) can set `verified`.
-- Gateway path: only a backend function that has confirmed with the provider can set `verified`.
-A Security Rule should reject any client write that sets `status: 'verified'` directly.
+All monetary fields are safe integers in paise. The server requires
+`amountDue == rentCharges.total`, `gatewayFee == 0`, and
+`totalPaid == amountDue`; clients cannot supply or update these values.
 
-**Side effect:** a `payments` doc reaching `verified` is what flips the linked `rentCharges.status` to `paid` (via backend function/transaction) — the two documents are never updated inconsistently.
+**Lifecycle:** payment documents are created only by `createUpiPayment()`.
+`pending_verification` transitions once to `verified` or `rejected` through
+`verifyUpiPayment()`. Rejected records remain in Firestore; a later submission
+creates a distinct payment with a new idempotency key and UTR. Approval retains
+the proof. Rejection queues proof deletion. Cleanup must never delete an asset
+referenced by a verified payment.
+
+Before either decision, `verifyUpiPayment()` independently validates the linked
+records: the payment's rent-charge, tenant, and landlord references match the
+rent charge; the rent charge's tenant, landlord, lease, property, and unit
+references match the corresponding lease, property, and unit; the lease has
+the same tenant, landlord, property, and unit; the property belongs to the
+landlord; and the unit belongs to the property and landlord with its
+`currentLeaseId` and status consistent with the linked lease under §§3 and 5
+(ending a lease clears its `currentLeaseId`). Missing or inconsistent linked
+records are rejected; denormalized payment IDs alone are not authoritative.
+
+### 7.1 `paymentUploadIntents`
+
+**Document ID:** deterministic SHA-256 of the UTF-8 bytes of
+`lowercase(idempotencyKey)`. The globally unique key allows the function to
+reject reuse across tenants or bills; the stored tenant/bill fields bind the
+intent to its authorized scope. Documents are server-only.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| tenantId | string (ref → users) | yes | Authenticated tenant who requested the upload. |
+| rentChargeId | string (ref → rentCharges) | yes | Bill the proof is exclusively for. |
+| idempotencyKey | string (UUID) | yes | Client-generated key for retrying the same intent request. |
+| publicId | string | yes | Random immutable Cloudinary asset ID under the Rently proof folder. |
+| folder | string | yes | Fixed server-controlled Cloudinary folder; not client-selected. |
+| resourceType | enum: `image` | yes | |
+| expectedFormat | enum: `jpg` \| `jpeg` \| `png` \| `webp` | yes | Client-declared format checked before issuing upload authorization, then compared with Cloudinary metadata. |
+| expectedBytes | integer | yes | Client-declared size, 1–5,000,000 inclusive; checked before issuing upload authorization, then compared with Cloudinary metadata. |
+| status | enum: `issued` \| `consumed` \| `cleanup_pending` \| `cleaned` \| `terminal_failure` | yes | `issued` is single-use; `consumed` binds to one payment. |
+| uploadPermissionExpiresAt | Timestamp | yes | Server-set expiry for the latest scoped Rently upload token; no later than token issuance + 10 minutes or `expiresAt`, whichever is earlier. |
+| expiresAt | Timestamp | yes | Server-set intent expiry, exactly `createdAt + 15 minutes`; independently checked at payment submission. |
+| uploadClaimId | string | no | Server-only transactional claim for an upload actively being forwarded to Cloudinary. |
+| uploadClaimExpiresAt | Timestamp | no | Server-only upload claim lease, set to 7 minutes from claim acquisition; expired claims can be reclaimed and do not block cleanup indefinitely. |
+| consumedByPaymentId | string (ref → payments) | no | Set atomically when consumed. |
+| cleanedAt | Timestamp | no | Set after deletion succeeds or the asset is already absent. |
+| createdAt / updatedAt | Timestamp | yes | Server timestamps. |
+
+`preparePaymentProofUpload()` creates the intent before returning a scoped
+upload permission. It is bound to the authenticated tenant and eligible bill.
+For a retry with the same key and scope, the same unexpired `issued` intent is
+returned with a permission that expires no later than the intent; reusing the
+key for another bill or tenant, or reusing an intent after it is consumed, is
+rejected. An expired key cannot be revived; the client starts a new intent
+with a new key. Each upload permission's 10-minute expiry is checked independently of the
+intent's 15-minute expiry. Cloudinary's standard signed upload signature lasts
+one hour; use the required server-mediated endpoint rather than exposing that
+signature to clients (cloud-functions.md §9 and §15).
+`createUpiPayment()` may consume it only once, before expiry, for the same
+tenant and bill, after verifying the uploaded Cloudinary asset. Clients cannot
+read or write intent documents directly. An expired, unconsumed intent is
+eligible for cleanup and cannot be consumed. The cleanup transaction changes
+an expired `issued` intent to `cleanup_pending` before creating its task, but
+defers while `uploadClaimId` has an unexpired lease. The upload handler clears
+its claim after the Cloudinary result is validated. If the intent becomes
+invalid while Cloudinary is creating the asset, the handler clears the claim
+and transactionally queues compensating cleanup. An upload claim is server-only
+and is not a payment or proof-consumption state.
+
+### 7.2 UPI reference claims
+
+`rentCharges/{rentChargeId}/upiReferences/{referenceHash}` is a server-only
+uniqueness claim. `referenceHash` is SHA-256 of the trimmed UTR normalized to
+uppercase. The document stores `{ paymentId, createdAt }` and is created in the
+payment transaction. Claims remain after rejection, preventing reuse of that
+bill's UTR for another attempt.
+
+### 7.3 `paymentProofCleanupOutbox`
+
+Server-only cleanup tasks are stored at
+`paymentProofCleanupOutbox/{taskId}`, where `taskId` is the payment ID for a
+rejected proof or `upload_<uploadIntentId>` for an expired, unconsumed intent.
+Each task has exactly one source:
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| sourceType | enum: `rejected_payment` \| `expired_upload_intent` | yes | |
+| paymentId | string (ref → payments) | conditional | Present only for rejected payment cleanup. |
+| uploadIntentId | string (ref → paymentUploadIntents) | conditional | Present only for expired intent cleanup. |
+| publicId | string | yes | For rejected-payment cleanup, exactly the rejected payment's immutable `proof.publicId`; for expired-intent cleanup, exactly the intent's `publicId`. |
+| folder | string | yes | Fixed server-controlled Cloudinary folder. |
+| resourceType | enum: `image` | yes | |
+| status | enum: `pending` \| `processing` \| `completed` \| `terminal_failure` | yes | |
+| attempts | integer | yes | Failed deletion attempts in the current automatic retry cycle; starts at 0 and is incremented for each actual deletion attempt, up to 5. |
+| manualRetryCount | integer | yes | Starts at 0; increments when an administrator requeues a terminal task. |
+| errorHistory | array of `{ attemptedAt: Timestamp, attempt: integer, error: string }` | yes | Append-only safe-to-log failure details; retained across manual retries. |
+| nextAttemptAt | Timestamp | yes | Earliest retry time. |
+| claimedBy | string | no | Worker claim identifier. |
+| claimExpiresAt | Timestamp | no | Lease expiry for recovery of abandoned processing claims. |
+| lastError | string | no | Last safe-to-log failure details. |
+| completedAt | Timestamp | no | |
+| createdAt / updatedAt | Timestamp | yes | Server timestamps. |
+
+A task may reference a rejected payment or expired, unconsumed upload intent,
+never a verified payment. For rejected-payment cleanup, `paymentId` identifies
+the rejected source record and `publicId` must match that record's immutable
+`proof.publicId`; the worker must validate this binding and verify that no
+verified payment references the proof before deletion.
+
+Automatic deletion is limited to five failed attempts per retry cycle, with
+exponential backoff (`baseDelay × 2^(attempts - 1)`). A failure on attempt five
+sets task and linked cleanup state to `terminal_failure`; preserve the task,
+`lastError`, and `errorHistory` for administrative review. An administrator may
+requeue the task, reset only the current-cycle `attempts`, and increment
+`manualRetryCount`; do not clear prior error history. Successful deletion
+(including an already-absent asset) completes the task and updates payment
+`proofCleanup.status` to `deleted` or the intent status to `cleaned`.
+Before deletion, workers must
+re-check that no verified payment references the asset.
 
 ---
 
@@ -280,7 +402,7 @@ Kept deliberately simple/flat otherwise — nothing in the source docs asks for 
 
 ## 9. `notifications`
 
-**Document ID:** auto-generated
+**Document ID:** auto-generated for action notifications; scheduled billing notifications use deterministic IDs so scheduler retries do not duplicate them.
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
@@ -299,6 +421,36 @@ Kept deliberately simple/flat otherwise — nothing in the source docs asks for 
 
 All rows are written by scheduled backend functions or by the accept/reject/submit actions server-side — never directly by a client claiming "notify this user."
 
+For UPI payment events, `relatedEntity` is `{ type: "payment", id:
+paymentId }`; notification IDs are deterministic from payment ID and event
+type. `payment_proof_submitted` goes to the owning landlord, `payment_accepted`
+goes to the tenant, and `payment_rejected` goes to the tenant. The rejection
+notification includes the selected `rejectionReason` label and, for `other`,
+the `rejectionExplanation`. Do not include the full UTR or proof URL in push
+text. A rejected payment is not by itself a fraud finding or tenant fraud label.
+
+### Device-token and delivery records
+
+FCM tokens are stored under `users/{uid}/deviceTokens/{tokenHash}`. The hash is
+SHA-256 of the token; the document stores the token, platform, and server
+timestamps. Only authenticated `registerDeviceToken()` and
+`unregisterDeviceToken()` calls may modify these records; direct client reads
+and writes are denied. Multiple devices are represented by separate token-hash
+documents.
+
+`notificationDeliveries/{notificationId}` is a server-only transactional
+outbox associated with a durable notification document. It records the
+recipient and fan-out status. Per-device retry records live at
+`notificationDeliveries/{notificationId}/devices/{tokenHash}` and track
+delivery status, attempts, a short claim lease, the next retry time, and
+inspectable terminal failure details. These operational records are separate
+from `notifications`, whose frozen fields are unchanged. Delivery attempts are
+bounded to five with exponential backoff from one minute up to six hours. A
+five-minute UTC recovery worker retries due records and reclaims expired
+processing leases. Delivery remains at-least-once: a duplicate push is
+possible if FCM accepts a push but its acknowledgment is lost before success is
+recorded; exactly-once push delivery is not claimed.
+
 ---
 
 ## 10. Cross-cutting relationships (summary)
@@ -306,33 +458,51 @@ All rows are written by scheduled backend functions or by the accept/reject/subm
 ```
 users (landlord) ──1:N── properties ──1:N── units ──1:1(current)── leases ──N:1── users (tenant)
                                                                        │
-                                                                       ├──1:N── rentCharges ──1:N── payments
-                                                                       │              └──subcol── fineApplications, adjustments
-                                                                       │
+                                                                       └──1:N── rentCharges ──1:N── payments
+                                                                                      ├──subcol── upiReferences
+                                                                                      ├──subcol── fineApplications, adjustments
+                                                                                      └──1:N── paymentUploadIntents
 properties ──1:N── joinRequests ──N:1── users (tenant)
 properties ──1:N── expenses
 users ──1:N── notifications
+paymentProofCleanupOutbox (server-only)
 ```
 
 ---
 
-## 11. Decisions (resolved) and remaining open item
+## 11. Prior decisions and remaining open items
 
-Three of the four items originally flagged here are now resolved:
+The prior architecture decisions remain:
 
 1. **Late-fine repeat semantics** — RESOLVED. `maxRepetitions = N` means the configured fine is auto-applied at most `N` times for that bill. After the `N`th application, no further automatic fine is added even if the bill remains unpaid (the landlord can still apply a `manual` fine separately, per §6.2's `ruleSource` field). `fineApplications.sequenceNumber` is what the scheduled job checks against `maxRepetitions` before applying another.
 
-2. **Multiple pending join requests / one active lease per tenant** — RESOLVED. A tenant may hold several `joinRequests` with `status: 'pending'` across different properties simultaneously. Once any one is accepted and a `leases` document is created, `users.activeLeaseId` becomes non-null — a tenant with a non-null `activeLeaseId` cannot be the subject of another *lease creation* (enforced transactionally at accept-time, see the implementation note below). Still open as a small app-logic (not schema) decision: whether a tenant's *other* pending requests should auto-reject the moment one is accepted, or remain pending for each landlord to decline individually. Doesn't affect the schema either way.
+2. **Multiple pending join requests / one active lease per tenant** — RESOLVED. A tenant may hold several `joinRequests` with `status: 'pending'` across different properties simultaneously. Once any one is accepted and a `leases` document is created, `users.activeLeaseId` becomes non-null — a tenant with a non-null `activeLeaseId` cannot be the subject of another *lease creation* (enforced transactionally at accept-time, see the implementation note below). Acceptance also auto-rejects the tenant's other pending requests, per §4.
 
-   *Implementation note for Phase 2:* the "accept request → create lease → set `activeLeaseId`" sequence must run as a single transaction that re-reads `users.activeLeaseId` immediately before writing, to close the race condition where two landlords accept the same tenant near-simultaneously.
+   *Implementation note for Phase 2:* the "accept request → create lease → set `activeLeaseId`" sequence must run as a single transaction that re-reads `users.activeLeaseId` immediately before writing, to close the race condition where two landlords accept the same tenant near-simultaneously. The chosen behavior is auto-rejection of the tenant's other pending requests, per §4.
 
-3. **Payment gateway provider** — still correctly UNRESOLVED. `payments.gatewayFee`/`totalPaid`/`transactionRef` are provider-agnostic by design; provider selection and the real fee calculation are deferred to Phase 7 per PRD §20. Do not let implementation choose a provider ahead of that.
+3. **Payment gateway provider** — still correctly UNRESOLVED and out of scope. The current §7 schema is UPI-only; do not add gateway payment methods, states, fees, or settlement behavior until provider selection in Phase 7 per PRD §20.
 
 4. **Lease-level `lateFineConfig` override** — RESOLVED at the schema level: the capability stays (a lease can carry its own `lateFineConfig` that takes precedence over the property's). This is a **UI-scope** decision, not a schema one: Phase 5/6 UI should only expose configuring the fine at the property level; the lease-level override field exists but stays unused by the UI until a concrete need appears.
 
-Only item 3 remains genuinely open, which is expected — it's explicitly out of scope until Phase 7 (PRD §20). Everything else in this schema is implementable without guessing, satisfying Phase 1's exit criteria.
+Payment implementation still requires the operational choices listed in
+`cloud-functions.md` §15. Standard Cloudinary signed-upload signatures remain
+valid for one hour, so the 10-minute permission must be enforced by the
+server-mediated upload endpoint; direct client-to-Cloudinary signatures are
+prohibited.
 
 ## 12. Changelog
+
+**v1.5** (approved UPI payment defaults):
+- Set proof formats and 5 MB maximum, separate 10-minute upload permission and 15-minute intent expiries, and five-attempt exponential cleanup retry policy (§7–§7.3).
+- Froze 6–30 character alphanumeric UTR validation and predefined rejection choices with a required 10–500 character explanation for `other`.
+- Required tenant rejection notifications to include the selected reason and explanation; rejected payments do not imply fraud.
+- Added optional server-only upload claim ID and expiry fields to coordinate upload and cleanup.
+
+**v1.4** (UPI payment submission contract):
+- Froze UPI-only payment fields, mandatory UTR, immutable UPI snapshots, payment idempotency key, review state, and proof cleanup state (§7).
+- Added server-only, short-lived, single-use `paymentUploadIntents`, per-bill UTR uniqueness claims, and a server-only proof-cleanup outbox (§7.1–§7.3).
+- Specified deterministic UPI payment notification events using the existing notification fields (§9).
+- Payment gateway fields and transitions are no longer part of the active contract; gateway integration remains out of scope.
 
 **v1.3** (this revision, per architecture audit):
 - Added `joinRequests.autoRejected`; resolved the pending-request question definitively: accepting one request auto-rejects a tenant's other pending ones (§4).

@@ -1,9 +1,13 @@
 import 'dart:math';
+
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 
-class PropertyService {
+import 'monthly_billing_repository.dart';
+import 'property_payment_details.dart';
+
+class PropertyService implements MonthlyBillingRepository {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
   final FirebaseFunctions _functions = FirebaseFunctions.instance;
   final FirebaseAuth _auth = FirebaseAuth.instance;
@@ -23,10 +27,18 @@ class PropertyService {
   Future<String> createProperty({
     required String name,
     required String address,
+    required String upiId,
+    required String upiQrImageUrl,
+    required String upiDisplayName,
     String? googleMapsLink,
   }) async {
     final uid = currentUid;
     if (uid == null) throw Exception('User not authenticated');
+    validatePropertyUpiDetails(
+      upiId: upiId,
+      upiQrImageUrl: upiQrImageUrl,
+      upiDisplayName: upiDisplayName,
+    );
 
     final joinCode = _generateJoinCode();
     final docRef = _firestore.collection('properties').doc();
@@ -36,7 +48,12 @@ class PropertyService {
       'landlordId': uid,
       'name': name.trim(),
       'address': address.trim(),
-      'googleMapsLink': googleMapsLink?.trim().isEmpty ?? true ? null : googleMapsLink!.trim(),
+      'googleMapsLink': googleMapsLink?.trim().isEmpty ?? true
+          ? null
+          : googleMapsLink!.trim(),
+      'upiId': upiId.trim(),
+      'upiQrImageUrl': normalizeUpiQrImageUrl(upiQrImageUrl),
+      'upiDisplayName': upiDisplayName.trim(),
       'joinCode': joinCode,
       'status': 'active',
       'createdAt': now,
@@ -44,6 +61,28 @@ class PropertyService {
     });
 
     return docRef.id;
+  }
+
+  Future<void> updatePropertyUpiDetails({
+    required String propertyId,
+    required String upiId,
+    required String upiQrImageUrl,
+    required String upiDisplayName,
+  }) async {
+    final uid = currentUid;
+    if (uid == null) throw Exception('User not authenticated');
+    validatePropertyUpiDetails(
+      upiId: upiId,
+      upiQrImageUrl: upiQrImageUrl,
+      upiDisplayName: upiDisplayName,
+    );
+
+    await _firestore.collection('properties').doc(propertyId).update({
+      'upiId': upiId.trim(),
+      'upiQrImageUrl': normalizeUpiQrImageUrl(upiQrImageUrl),
+      'upiDisplayName': upiDisplayName.trim(),
+      'updatedAt': FieldValue.serverTimestamp(),
+    });
   }
 
   /// Stream of all active/managed properties for the current landlord.
@@ -85,7 +124,9 @@ class PropertyService {
   }
 
   /// Stream of all units belonging to a specific property.
-  Stream<QuerySnapshot<Map<String, dynamic>>> getPropertyUnitsStream(String propertyId) {
+  Stream<QuerySnapshot<Map<String, dynamic>>> getPropertyUnitsStream(
+    String propertyId,
+  ) {
     final uid = currentUid;
     if (uid == null) return const Stream.empty();
 
@@ -156,7 +197,9 @@ class PropertyService {
   }
 
   /// Stream of landlord's leases (optionally filtered by status: 'active' or 'ended').
-  Stream<QuerySnapshot<Map<String, dynamic>>> getLandlordLeasesStream({String? status}) {
+  Stream<QuerySnapshot<Map<String, dynamic>>> getLandlordLeasesStream({
+    String? status,
+  }) {
     final uid = currentUid;
     if (uid == null) return const Stream.empty();
 
@@ -171,8 +214,219 @@ class PropertyService {
     return query.snapshots();
   }
 
+  @override
+  Stream<List<BillingLease>> watchLandlordLeases() {
+    return getLandlordLeasesStream().map(
+      (snapshot) => snapshot.docs
+          .map((doc) => BillingLease.fromMap(doc.id, doc.data()))
+          .toList(),
+    );
+  }
+
+  @override
+  Stream<Map<String, RentChargeRecord>> watchChargesForMonth(
+    String billingMonth,
+  ) {
+    final uid = currentUid;
+    if (uid == null) return const Stream.empty();
+
+    return _firestore
+        .collection('rentCharges')
+        .where('landlordId', isEqualTo: uid)
+        .where('billingMonth', isEqualTo: billingMonth)
+        .snapshots()
+        .map(
+          (snapshot) => {
+            for (final doc in snapshot.docs)
+              doc.data()['leaseId'] as String: RentChargeRecord.fromMap(
+                doc.id,
+                doc.data(),
+              ),
+          },
+        );
+  }
+
+  @override
+  Future<String> saveDraft({
+    required BillingLease lease,
+    required String billingMonth,
+    required List<BillingLineItem> lineItems,
+    required Timestamp? expectedUpdatedAt,
+  }) async {
+    final uid = currentUid;
+    if (uid == null) throw Exception('User not authenticated');
+    if (!RegExp(r'^(0[0-9]{3}|[1-9][0-9]{3})-(0[1-9]|1[0-2])$')
+        .hasMatch(billingMonth)) {
+      throw ArgumentError.value(billingMonth, 'billingMonth');
+    }
+
+    final rentChargeId = '${lease.id}_$billingMonth';
+    final subtotal = calculateSubtotal(lineItems);
+    final rentChargeRef = _firestore
+        .collection('rentCharges')
+        .doc(rentChargeId);
+    final leaseRef = _firestore.collection('leases').doc(lease.id);
+
+    await _firestore.runTransaction((transaction) async {
+      final existing = await transaction.get(rentChargeRef);
+      final leaseSnapshot = await transaction.get(leaseRef);
+      final leaseData = leaseSnapshot.data();
+      if (!leaseSnapshot.exists ||
+          leaseData?['status'] != 'active' ||
+          leaseData?['landlordId'] != uid ||
+          leaseData?['tenantId'] != lease.tenantId ||
+          leaseData?['propertyId'] != lease.propertyId ||
+          leaseData?['unitId'] != lease.unitId) {
+        throw StateError(
+          'This lease is no longer active. Draft editing is unavailable.',
+        );
+      }
+
+      if (existing.exists) {
+        final existingData = existing.data()!;
+        if (existingData['status'] != 'draft') {
+          throw StateError('Finalized bills cannot be edited.');
+        }
+
+        if (expectedUpdatedAt == null) {
+          if (_matchesDraft(
+            existingData,
+            lease: lease,
+            billingMonth: billingMonth,
+            lineItems: lineItems,
+            subtotal: subtotal,
+          )) {
+            return;
+          }
+          throw StateError(
+            'A draft already exists. Reload it before making changes.',
+          );
+        }
+
+        final currentUpdatedAt = existingData['updatedAt'];
+        if (currentUpdatedAt is! Timestamp ||
+            currentUpdatedAt.compareTo(expectedUpdatedAt) != 0) {
+          throw StateError(
+            'This draft changed since it was opened. Reload it before saving.',
+          );
+        }
+
+        transaction.update(rentChargeRef, {
+          'lineItems': lineItems.map((item) => item.toMap()).toList(),
+          'subtotal': subtotal,
+          'total': subtotal,
+          'updatedAt': FieldValue.serverTimestamp(),
+        });
+        return;
+      }
+
+      if (expectedUpdatedAt != null) {
+        throw StateError(
+          'This draft is no longer available. Reload the billing screen.',
+        );
+      }
+
+      final now = FieldValue.serverTimestamp();
+      transaction.set(rentChargeRef, {
+        'status': 'draft',
+        'leaseId': lease.id,
+        'landlordId': uid,
+        'tenantId': lease.tenantId,
+        'propertyId': lease.propertyId,
+        'unitId': lease.unitId,
+        'billingMonth': billingMonth,
+        'lineItems': lineItems.map((item) => item.toMap()).toList(),
+        'subtotal': subtotal,
+        'lateFineTotal': 0,
+        'adjustmentTotal': 0,
+        'total': subtotal,
+        'dueDate': '$billingMonth-10',
+        'createdAt': now,
+        'updatedAt': now,
+      });
+    });
+
+    return rentChargeId;
+  }
+
+  bool _matchesDraft(
+    Map<String, dynamic> data, {
+    required BillingLease lease,
+    required String billingMonth,
+    required List<BillingLineItem> lineItems,
+    required int subtotal,
+  }) {
+    final savedItems = data['lineItems'];
+    if (savedItems is! List || savedItems.length != lineItems.length) {
+      return false;
+    }
+
+    for (var index = 0; index < lineItems.length; index++) {
+      final saved = savedItems[index];
+      final item = lineItems[index];
+      if (saved is! Map ||
+          saved['type'] != item.type ||
+          saved['label'] != item.label ||
+          saved['amount'] != item.amount) {
+        return false;
+      }
+    }
+
+    return data['leaseId'] == lease.id &&
+        data['landlordId'] == lease.landlordId &&
+        data['tenantId'] == lease.tenantId &&
+        data['propertyId'] == lease.propertyId &&
+        data['unitId'] == lease.unitId &&
+        data['billingMonth'] == billingMonth &&
+        data['subtotal'] == subtotal &&
+        data['total'] == subtotal;
+  }
+
+  @override
+  Future<FinalizedRentCharge> finalize(String rentChargeId) async {
+    final result = await _functions.httpsCallable('finalizeRentCharge').call({
+      'rentChargeId': rentChargeId,
+    });
+    final data = Map<String, dynamic>.from(result.data as Map);
+    final total = data['total'];
+    final dueDate = data['dueDate'];
+    if (total is! int || dueDate is! String) {
+      throw StateError('finalizeRentCharge returned an invalid response.');
+    }
+    return FinalizedRentCharge(total: total, dueDate: dueDate);
+  }
+
+  @override
+  int calculateSubtotal(List<BillingLineItem> lineItems) {
+    if (lineItems.isEmpty || lineItems.length > 10) {
+      throw ArgumentError('A bill must have between one and ten line items.');
+    }
+    final allowedTypes = {'rent', 'electricity', 'maintenance', 'other'};
+    var rentCount = 0;
+    var subtotal = 0;
+    for (final item in lineItems) {
+      if (!allowedTypes.contains(item.type) ||
+          item.label.trim().isEmpty ||
+          item.amount < 0 ||
+          item.amount > 9007199254740991) {
+        throw ArgumentError('The bill contains an invalid line item.');
+      }
+      if (item.type == 'rent') rentCount++;
+      subtotal += item.amount;
+      if (subtotal > 9007199254740991) {
+        throw ArgumentError('The bill total exceeds the supported range.');
+      }
+    }
+    if (rentCount != 1) {
+      throw ArgumentError('A bill must contain exactly one rent line item.');
+    }
+    return subtotal;
+  }
+
   /// Stream of room tenancy history (active and past leases for a specific room).
-  Stream<QuerySnapshot<Map<String, dynamic>>> getUnitLeasesStream(String unitId) {
+  Stream<QuerySnapshot<Map<String, dynamic>>> getUnitLeasesStream(
+    String unitId,
+  ) {
     final uid = currentUid;
     if (uid == null) return const Stream.empty();
 
@@ -211,7 +465,8 @@ class PropertyService {
     final callable = _functions.httpsCallable('createJoinRequest');
     final result = await callable.call({
       'propertyId': propertyId,
-      if (message != null && message.trim().isNotEmpty) 'message': message.trim(),
+      if (message != null && message.trim().isNotEmpty)
+        'message': message.trim(),
     });
     final data = Map<String, dynamic>.from(result.data as Map);
     return data['joinRequestId'] as String;
@@ -229,7 +484,9 @@ class PropertyService {
   }
 
   /// Fetch details of a lease document.
-  Future<DocumentSnapshot<Map<String, dynamic>>> getLease(String leaseId) async {
+  Future<DocumentSnapshot<Map<String, dynamic>>> getLease(
+    String leaseId,
+  ) async {
     return await _firestore.collection('leases').doc(leaseId).get();
   }
 
@@ -239,7 +496,9 @@ class PropertyService {
   }
 
   /// Fetch details of a property document.
-  Future<DocumentSnapshot<Map<String, dynamic>>> getProperty(String propertyId) async {
+  Future<DocumentSnapshot<Map<String, dynamic>>> getProperty(
+    String propertyId,
+  ) async {
     return await _firestore.collection('properties').doc(propertyId).get();
   }
 }
